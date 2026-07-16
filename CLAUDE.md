@@ -10,9 +10,10 @@ listing. It's built to showcase Agent Architecture Design, Computer Vision (loca
 and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so code should reflect deliberate,
 enterprise-style patterns rather than the shortest path to a working demo.
 
-Only the first two pipeline stages exist so far: local image classification and Claude-based structured
-identification. The pricing/research subagent, orchestrator, eBay Sell API integration, and HITL approval
-gate described below under "Planned architecture" are not yet implemented.
+So far: local image classification, Claude-based structured identification, and a FastAPI upload front end
+that chains the two with a human clarification step. The pricing/research subagent, orchestrator, eBay Sell
+API integration, and eBay-listing HITL approval gate described below under "Planned architecture" are not
+yet implemented.
 
 ## Commands
 
@@ -27,6 +28,9 @@ uv run python -m src.ml.vision_preprocessor <image_path> [--top-k N] [--device c
 
 # Full pipeline: local classifier -> Claude Vision Subagent
 uv run python -m src.agents.vision_subagent <image_path> [--model claude-sonnet-5]
+
+# Web app (upload UI + API), served at http://127.0.0.1:8000
+uv run uvicorn src.web.app:app --reload
 ```
 
 `ANTHROPIC_API_KEY` must be set in `.env` (see `.env.example`) for anything in `src/agents/` to work —
@@ -57,9 +61,20 @@ notes, distinguishing features, and a confidence level. The system prompt explic
 its own visual read over the local classifier's guess when they disagree, and to return `null` for
 brand/model number rather than guess.
 
-**Package layout is deliberate:** `src/`, `src/ml/`, `src/agents/` have no `__init__.py` — they work as
-Python 3.14 implicit namespace packages. Do not add empty `__init__.py` files back in; only add one if it
-needs to hold real code.
+**`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
+(git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp), runs the same two stages
+above, and returns the result directly if `identification_confidence` is `"medium"`/`"high"`. If it's
+`"low"`, it instead returns `status: "needs_clarification"` plus an `upload_id` and leaves the file on disk.
+The frontend (`src/web/static/index.html`, vanilla JS) then prompts the user for the item's name and posts
+it to `POST /api/identify/refine`, which re-runs `VisionSubagent.identify(..., user_provided_name=...)` with
+that hint folded into the prompt and always returns a final result (no further clarification loop). Both
+endpoints delete the uploaded file once they return a final result. The `VisionPreprocessor`/`VisionSubagent`
+instances are constructed once at module import time and reused across requests — re-instantiating per
+request would reload the ResNet50 weights every call.
+
+**Package layout is deliberate:** `src/`, `src/ml/`, `src/agents/`, `src/web/` have no `__init__.py` — they
+work as Python 3.14 implicit namespace packages. Do not add empty `__init__.py` files back in; only add one
+if it needs to hold real code.
 
 ### Planned architecture (not yet built)
 

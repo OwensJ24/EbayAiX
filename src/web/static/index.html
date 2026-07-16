@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AgentX — Item Identifier</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  #dropzone { border: 2px dashed #999; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; }
+  #dropzone.drag { border-color: #333; background: #f5f5f5; }
+  #status { margin-top: 1rem; white-space: pre-wrap; }
+  #preview { max-width: 100%; max-height: 300px; margin-top: 1rem; display: none; }
+  .error { color: #b00020; }
+  pre { background: #f5f5f5; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+  button { padding: 0.5rem 1rem; margin-top: 0.5rem; cursor: pointer; }
+  input[type="text"] { padding: 0.4rem; width: 100%; box-sizing: border-box; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+  <h1>AgentX — Item Identifier</h1>
+  <p>Upload a photo of the item (JPEG/PNG/WEBP, up to 10MB).</p>
+
+  <div id="dropzone">
+    <p>Click to choose a file, or drag one here</p>
+    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" hidden>
+  </div>
+
+  <img id="preview" alt="preview">
+  <div id="status"></div>
+  <div id="clarification" style="display:none;">
+    <p><strong>Not confident on this one.</strong> What is the name of this item?</p>
+    <input type="text" id="itemNameInput" placeholder="e.g. Sony WH-1000XM4 headphones">
+    <button id="submitClarification">Continue</button>
+  </div>
+
+  <script>
+    const MAX_BYTES = 10 * 1024 * 1024;
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const preview = document.getElementById('preview');
+    const statusEl = document.getElementById('status');
+    const clarificationEl = document.getElementById('clarification');
+    const itemNameInput = document.getElementById('itemNameInput');
+    const submitClarificationBtn = document.getElementById('submitClarification');
+
+    let currentUploadId = null;
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('drag');
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) handleFile(fileInput.files[0]);
+    });
+
+    function handleFile(file) {
+      clarificationEl.style.display = 'none';
+      currentUploadId = null;
+
+      if (file.size > MAX_BYTES) {
+        statusEl.innerHTML = `<p class="error">File is ${(file.size / 1024 / 1024).toFixed(1)}MB — max is 10MB.</p>`;
+        return;
+      }
+
+      preview.src = URL.createObjectURL(file);
+      preview.style.display = 'block';
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      statusEl.textContent = 'Identifying…';
+      fetch('/api/identify', { method: 'POST', body: formData })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then(handleResponse)
+        .catch((err) => {
+          statusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        });
+    }
+
+    function handleResponse(data) {
+      if (data.status === 'needs_clarification') {
+        currentUploadId = data.upload_id;
+        statusEl.innerHTML = `<p>Best guess so far:</p><pre>${JSON.stringify(data.result, null, 2)}</pre>`;
+        clarificationEl.style.display = 'block';
+      } else {
+        clarificationEl.style.display = 'none';
+        statusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
+      }
+    }
+
+    submitClarificationBtn.addEventListener('click', () => {
+      const itemName = itemNameInput.value.trim();
+      if (!itemName || !currentUploadId) return;
+
+      statusEl.textContent = 'Refining…';
+      clarificationEl.style.display = 'none';
+
+      fetch('/api/identify/refine', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ upload_id: currentUploadId, item_name: itemName }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then(handleResponse)
+        .catch((err) => {
+          statusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        });
+    });
+  </script>
+</body>
+</html>

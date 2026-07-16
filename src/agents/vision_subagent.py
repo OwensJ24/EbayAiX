@@ -61,9 +61,23 @@ class VisionSubagent:
         data = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
         return data, media_type
 
-    def identify(self, image_path: str | Path, local_classification: ClassificationResult) -> ProductIdentification:
+    def identify(
+        self,
+        image_path: str | Path,
+        local_classification: ClassificationResult,
+        user_provided_name: str | None = None,
+    ) -> ProductIdentification:
         image_data, media_type = self._encode_image(image_path)
         local_context = json.dumps(local_classification.to_dict(), indent=2)
+
+        prompt_text = f"Local ResNet50 classifier output:\n{local_context}\n\n"
+        if user_provided_name:
+            prompt_text += (
+                f'The user has confirmed this item is: "{user_provided_name}". '
+                "Use this to identify the specific brand, model number, and category as "
+                "precisely as possible.\n\n"
+            )
+        prompt_text += "Identify this item."
 
         response = self.client.messages.parse(
             model=self.model,
@@ -73,7 +87,7 @@ class VisionSubagent:
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
-                    {"type": "text", "text": f"Local ResNet50 classifier output:\n{local_context}\n\nIdentify this item."},
+                    {"type": "text", "text": prompt_text},
                 ],
             }],
             output_format=ProductIdentification,
