@@ -5,13 +5,14 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+import anthropic
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.agents.vision_subagent import VisionSubagent
-from src.ml.vision_preprocessor import VisionPreprocessor
+from src.agents.vision_subagent import ProductIdentification, VisionSubagent
+from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -66,11 +67,35 @@ def _save_upload(file: UploadFile) -> Path:
     return path
 
 
+def _run_vision_subagent(
+    path: Path,
+    local_result: ClassificationResult,
+    user_provided_name: str | None = None,
+) -> ProductIdentification:
+    try:
+        return _vision_subagent.identify(path, local_result, user_provided_name=user_provided_name)
+    except anthropic.OverloadedError:
+        raise HTTPException(
+            status_code=503,
+            detail="Claude's API is temporarily overloaded. Please try again in a moment.",
+        )
+    except anthropic.RateLimitError:
+        raise HTTPException(status_code=503, detail="Rate limit reached. Please try again shortly.")
+    except anthropic.APIConnectionError:
+        raise HTTPException(status_code=503, detail="Could not reach Claude's API. Check your network connection.")
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {e.message}")
+
+
 @app.post("/api/identify")
 def identify(file: UploadFile = File(...)) -> dict:
     path = _save_upload(file)
-    local_result = _preprocessor.classify(path)
-    identification = _vision_subagent.identify(path, local_result)
+    try:
+        local_result = _preprocessor.classify(path)
+        identification = _run_vision_subagent(path, local_result)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
     if identification.identification_confidence == "low":
         return {
@@ -90,8 +115,10 @@ def refine(payload: RefineRequest) -> dict:
         raise HTTPException(status_code=404, detail="Upload not found or already processed")
     path = matches[0]
 
-    local_result = _preprocessor.classify(path)
-    identification = _vision_subagent.identify(path, local_result, user_provided_name=payload.item_name)
+    try:
+        local_result = _preprocessor.classify(path)
+        identification = _run_vision_subagent(path, local_result, user_provided_name=payload.item_name)
+    finally:
+        path.unlink(missing_ok=True)
 
-    path.unlink(missing_ok=True)
     return {"status": "complete", "result": identification.model_dump()}
