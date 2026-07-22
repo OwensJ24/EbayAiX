@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import urllib.parse
 from typing import Literal
 
@@ -15,6 +16,8 @@ from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ml.vision_preprocessor import VisionPreprocessor
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You are a resale pricing analyst. Research pricing using ONLY eBay — never cite or "
@@ -67,6 +70,8 @@ def _build_search_queries(identification: ProductIdentification) -> list[str]:
     queries.append(identification.category)
 
     # Dedupe while preserving order, drop anything that collapsed to empty/whitespace.
+    # Capped at 2: each query becomes a web_fetch call, and each fetched eBay search
+    # page can be huge, so keeping the URL count low matters as much as max_content_tokens.
     seen: set[str] = set()
     deduped: list[str] = []
     for q in queries:
@@ -74,7 +79,7 @@ def _build_search_queries(identification: ProductIdentification) -> list[str]:
         if q and q not in seen:
             seen.add(q)
             deduped.append(q)
-    return deduped[:3]
+    return deduped[:2]
 
 
 class ComparableListing(BaseModel):
@@ -116,9 +121,15 @@ def _extract_json(text: str) -> dict:
 class PricingSubagent:
     """Wraps a Claude call that reads eBay's own sold-listings pages to research pricing."""
 
-    def __init__(self, model: str = "claude-sonnet-5", max_searches: int = 5) -> None:
+    def __init__(
+        self,
+        model: str = "claude-sonnet-5",
+        max_searches: int = 2,
+        max_content_tokens: int = 3000,
+    ) -> None:
         self.model = model
         self.max_searches = max_searches
+        self.max_content_tokens = max_content_tokens
         self.client = anthropic.Anthropic()
 
     def research_price(self, identification: ProductIdentification) -> PricingRecommendation:
@@ -129,13 +140,19 @@ class PricingSubagent:
 
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=2048,
             system=_SYSTEM_PROMPT,
             tools=[
                 {
                     "type": "web_fetch_20260209",
                     "name": "web_fetch",
-                    "max_uses": len(sold_urls) + 2,
+                    "max_uses": len(sold_urls) + 1,
+                    # Each fetched eBay search page can be huge (dozens of listing
+                    # cards, sponsored content, scripts-as-text) — without this cap
+                    # a single request can balloon into hundreds of thousands of
+                    # input tokens, since server-side tool results stay in context
+                    # for every subsequent step within the same request.
+                    "max_content_tokens": self.max_content_tokens,
                     "allowed_domains": ["ebay.com"],
                 },
                 {
@@ -155,6 +172,12 @@ class PricingSubagent:
             }],
         )
 
+        logger.info(
+            "PricingSubagent.research_price token usage: input=%d output=%d",
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
+
         # Take the LAST text block, not the first: with multiple tool-call rounds
         # (web_fetch, possibly web_search too), Claude often emits an early text
         # block like "Let me check eBay's sold listings..." before any tool use —
@@ -168,6 +191,8 @@ class PricingSubagent:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser(
         description="Run the local classifier + Vision Subagent + Pricing Subagent on an image."
     )

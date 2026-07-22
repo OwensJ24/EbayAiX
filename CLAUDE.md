@@ -100,6 +100,16 @@ Structured outputs (`output_format=`) aren't used here — tool use plus `output
 request is a combination worth double-checking against the current API docs before relying on it — so this
 instead prompts for raw JSON and validates it via `PricingRecommendation.model_validate()` after a small
 `_extract_json` cleanup step (strips markdown code fences models sometimes add despite being told not to).
+
+**Cost controls (load-bearing, not optional):** a real eBay search-results page is huge — dozens of listing
+cards, sponsored content, scripts-as-text — and server-side tool results stay in context for every
+subsequent step within the same request, so an uncapped fetch compounds fast. This burned through the whole
+Anthropic account balance in a couple of test runs before these caps existed. `web_fetch`'s
+`max_content_tokens` (default 3000, constructor arg) caps each fetched page; `_build_search_queries()` caps
+at 2 URLs (fewer fetch calls); `web_search`'s `max_uses` defaults to 2. Don't raise any of these without a
+specific reason — they're the actual limiter, not a suggestion. `research_price()` logs
+`response.usage.input_tokens`/`output_tokens` via the standard `logging` module after every call
+(`PricingSubagent.research_price` logger) so token spend per request stays visible.
 **Take the LAST text block from `response.content`, not the first.** With multiple tool-call rounds (fetch,
 possibly search too), Claude often emits an early text block like "Let me check eBay's sold listings..."
 before any tool use; grabbing the first text block gets that commentary instead of the final JSON-only
