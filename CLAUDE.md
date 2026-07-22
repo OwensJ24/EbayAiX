@@ -10,11 +10,11 @@ listing. It's built to showcase Agent Architecture Design, Computer Vision (loca
 and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so code should reflect deliberate,
 enterprise-style patterns rather than the shortest path to a working demo.
 
-So far: local image classification, Claude-based structured identification, a FastAPI upload front end that
-chains the two with a human clarification step, and an eBay OAuth 2.0 connect flow. The pricing/research
-subagent, orchestrator, actual eBay listing-creation calls, and the HITL approval gate in front of them
-(described below under "Planned architecture") are not yet implemented — eBay's Sell APIs themselves haven't
-been called yet, only the auth handshake.
+So far: local image classification, Claude-based structured identification, a Pricing/Research Subagent
+(agentic web search for resale comps), a FastAPI front end chaining all three with a human clarification
+step, and an eBay OAuth 2.0 connect flow. The orchestrator, actual eBay listing-creation calls, and the HITL
+approval gate in front of them (described below under "Planned architecture") are not yet implemented —
+eBay's Sell APIs themselves haven't been called yet, only the auth handshake.
 
 ## Commands
 
@@ -85,16 +85,31 @@ notes, distinguishing features, and a confidence level. The system prompt explic
 its own visual read over the local classifier's guess when they disagree, and to return `null` for
 brand/model number rather than guess.
 
+**`src/agents/pricing_subagent.py`** — calls the Claude API with the `web_search_20260209` server-side tool.
+`PricingSubagent.research_price(identification)` sends the `ProductIdentification` as context and instructs
+Claude to search for real sold/completed comps (not asking prices) across a few search phrasings, then
+return a single raw JSON object matching `PricingRecommendation` (suggested price, price range, comparable
+listings, reasoning, confidence). Structured outputs (`output_format=`) aren't used here — tool use plus
+`output_config.format` in the same request is a combination worth double-checking against the current API
+docs before relying on it, so this instead prompts for raw JSON and validates it via
+`PricingRecommendation.model_validate()` after a small `_extract_json` cleanup step (strips markdown code
+fences models sometimes add despite being told not to).
+
 **`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
-(git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp), runs the same two stages
-above, and returns the result directly if `identification_confidence` is `"medium"`/`"high"`. If it's
-`"low"`, it instead returns `status: "needs_clarification"` plus an `upload_id` and leaves the file on disk.
-The frontend (`src/web/static/index.html`, vanilla JS) then prompts the user for the item's name and posts
-it to `POST /api/identify/refine`, which re-runs `VisionSubagent.identify(..., user_provided_name=...)` with
-that hint folded into the prompt and always returns a final result (no further clarification loop). Both
-endpoints delete the uploaded file once they return a final result. The `VisionPreprocessor`/`VisionSubagent`
-instances are constructed once at module import time and reused across requests — re-instantiating per
-request would reload the ResNet50 weights every call.
+(git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp), runs the local classifier +
+Vision Subagent, and returns the result directly if `identification_confidence` is `"medium"`/`"high"`. If
+it's `"low"`, it instead returns `status: "needs_clarification"` plus an `upload_id` and leaves the file on
+disk. The frontend (`src/web/static/index.html`, vanilla JS) then prompts the user for the item's name and
+posts it to `POST /api/identify/refine`, which re-runs `VisionSubagent.identify(..., user_provided_name=...)`
+with that hint folded into the prompt and always returns a final result (no further clarification loop).
+Both endpoints delete the uploaded file once they return a final result. Once identification is final, the
+frontend shows a "Get Price Estimate" button that posts the `ProductIdentification` (FastAPI validates the
+JSON body directly against that Pydantic model) to `POST /api/price`, which runs the Pricing Subagent. The
+`VisionPreprocessor`/`VisionSubagent`/`PricingSubagent` instances are all constructed once at module import
+time and reused across requests — re-instantiating per request would reload the ResNet50 weights every
+call. `_call_claude()` wraps every subagent call and translates `OverloadedError`/`RateLimitError`/
+`APIConnectionError`/`APIStatusError` into a clean `503`/`502` HTTP response instead of a bare 500 — this
+was added after a real Anthropic-side outage surfaced as an unhandled exception during development.
 
 **`src/ebay/`** — eBay OAuth 2.0 (authorization-code grant for user access tokens), no listing calls yet.
 `config.py` loads `EbayConfig` from env and resolves sandbox vs. production base/token/authorize URLs.
@@ -113,7 +128,6 @@ back in; only add one if it needs to hold real code.
 ### Planned architecture (not yet built)
 
 Per the original design: a hierarchical Orchestrator-Workers pattern where a Claude-based orchestrator
-routes between the Vision Subagent (above), a Pricing/Research Subagent (agentic web search for historical
-eBay sold-listing data), and eBay Sell REST API calls (using the OAuth tokens `src/ebay/` already handles)
-to create draft listings — gated behind a mandatory Human-in-the-Loop manual approval step before any live
-write to eBay.
+routes between the Vision Subagent, the Pricing Subagent (both above), and eBay Sell REST API calls (using
+the OAuth tokens `src/ebay/` already handles) to create draft listings — gated behind a mandatory
+Human-in-the-Loop manual approval step before any live write to eBay.

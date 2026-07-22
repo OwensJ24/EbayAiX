@@ -36,6 +36,8 @@
     <input type="text" id="itemNameInput" placeholder="e.g. Sony WH-1000XM4 headphones">
     <button id="submitClarification">Continue</button>
   </div>
+  <button id="priceButton" style="display:none;">Get Price Estimate</button>
+  <div id="priceStatus"></div>
 
   <script>
     const MAX_BYTES = 10 * 1024 * 1024;
@@ -46,8 +48,11 @@
     const clarificationEl = document.getElementById('clarification');
     const itemNameInput = document.getElementById('itemNameInput');
     const submitClarificationBtn = document.getElementById('submitClarification');
+    const priceButton = document.getElementById('priceButton');
+    const priceStatusEl = document.getElementById('priceStatus');
 
     let currentUploadId = null;
+    let currentIdentification = null;
 
     const ebayStatusEl = document.getElementById('ebayStatus');
     fetch('/ebay/status')
@@ -77,7 +82,10 @@
 
     function handleFile(file) {
       clarificationEl.style.display = 'none';
+      priceButton.style.display = 'none';
+      priceStatusEl.innerHTML = '';
       currentUploadId = null;
+      currentIdentification = null;
 
       if (file.size > MAX_BYTES) {
         statusEl.innerHTML = `<p class="error">File is ${(file.size / 1024 / 1024).toFixed(1)}MB — max is 10MB.</p>`;
@@ -106,13 +114,44 @@
     function handleResponse(data) {
       if (data.status === 'needs_clarification') {
         currentUploadId = data.upload_id;
+        currentIdentification = null;
+        priceButton.style.display = 'none';
         statusEl.innerHTML = `<p>Best guess so far:</p><pre>${JSON.stringify(data.result, null, 2)}</pre>`;
         clarificationEl.style.display = 'block';
       } else {
         clarificationEl.style.display = 'none';
+        currentIdentification = data.result;
+        priceButton.style.display = 'inline-block';
         statusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
       }
     }
+
+    priceButton.addEventListener('click', () => {
+      if (!currentIdentification) return;
+
+      priceButton.disabled = true;
+      priceStatusEl.textContent = 'Researching comparable sold prices…';
+
+      fetch('/api/price', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(currentIdentification),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then((data) => {
+          priceStatusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
+        })
+        .catch((err) => {
+          priceStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          priceButton.disabled = false;
+        });
+    });
 
     submitClarificationBtn.addEventListener('click', () => {
       const itemName = itemNameInput.value.trim();

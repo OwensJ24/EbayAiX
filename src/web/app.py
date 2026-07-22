@@ -1,9 +1,10 @@
-"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent."""
+"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent -> Pricing Subagent."""
 
 from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import anthropic
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -11,9 +12,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.agents.pricing_subagent import PricingSubagent
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
+
+T = TypeVar("T")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -31,6 +35,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # construction are both too expensive to redo per request.
 _preprocessor = VisionPreprocessor()
 _vision_subagent = VisionSubagent()
+_pricing_subagent = PricingSubagent()
 
 
 class RefineRequest(BaseModel):
@@ -69,13 +74,10 @@ def _save_upload(file: UploadFile) -> Path:
     return path
 
 
-def _run_vision_subagent(
-    path: Path,
-    local_result: ClassificationResult,
-    user_provided_name: str | None = None,
-) -> ProductIdentification:
+def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
+    """Run a Claude-backed subagent call, translating transient API failures into clean HTTP errors."""
     try:
-        return _vision_subagent.identify(path, local_result, user_provided_name=user_provided_name)
+        return fn(*args, **kwargs)
     except anthropic.OverloadedError:
         raise HTTPException(
             status_code=503,
@@ -94,7 +96,7 @@ def identify(file: UploadFile = File(...)) -> dict:
     path = _save_upload(file)
     try:
         local_result = _preprocessor.classify(path)
-        identification = _run_vision_subagent(path, local_result)
+        identification = _call_claude(_vision_subagent.identify, path, local_result)
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -119,8 +121,16 @@ def refine(payload: RefineRequest) -> dict:
 
     try:
         local_result = _preprocessor.classify(path)
-        identification = _run_vision_subagent(path, local_result, user_provided_name=payload.item_name)
+        identification = _call_claude(
+            _vision_subagent.identify, path, local_result, user_provided_name=payload.item_name
+        )
     finally:
         path.unlink(missing_ok=True)
 
     return {"status": "complete", "result": identification.model_dump()}
+
+
+@app.post("/api/price")
+def price(identification: ProductIdentification) -> dict:
+    pricing = _call_claude(_pricing_subagent.research_price, identification)
+    return {"status": "complete", "result": pricing.model_dump()}
