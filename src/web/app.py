@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
+from src.web.ebay_routes import router as ebay_router
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -23,6 +24,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="AgentX")
+app.include_router(ebay_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Loaded once at process startup — ResNet50 weight loading and API client
