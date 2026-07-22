@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: agentx
+    env: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: EBAY_APP_ID
+        sync: false
+      - key: EBAY_CERT_ID
+        sync: false
+      - key: EBAY_RU_NAME
+        sync: false
+      - key: EBAY_ENVIRONMENT
+        value: sandbox

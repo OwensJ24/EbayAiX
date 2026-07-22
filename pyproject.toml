@@ -14,3 +14,15 @@ dependencies = [
     "torchvision>=0.28.0",
     "uvicorn[standard]>=0.51.0",
 ]
+
+# On Linux (our Docker/Render target), pull CPU-only PyTorch wheels instead of
+# the default CUDA build — macOS has no CUDA variant to begin with, so local
+# dev is unaffected and keeps resolving from the default index (with MPS support).
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "platform_system != 'Darwin'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "platform_system != 'Darwin'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
