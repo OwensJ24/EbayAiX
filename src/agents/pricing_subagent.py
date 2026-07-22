@@ -155,11 +155,15 @@ class PricingSubagent:
             }],
         )
 
-        text = next((block.text for block in response.content if block.type == "text"), None)
-        if text is None:
+        # Take the LAST text block, not the first: with multiple tool-call rounds
+        # (web_fetch, possibly web_search too), Claude often emits an early text
+        # block like "Let me check eBay's sold listings..." before any tool use —
+        # the actual JSON-only final answer is whatever text block comes last.
+        text_blocks = [block.text for block in response.content if block.type == "text"]
+        if not text_blocks:
             raise RuntimeError("Pricing Subagent returned no text content to parse")
 
-        data = _extract_json(text)
+        data = _extract_json(text_blocks[-1])
         return PricingRecommendation.model_validate(data)
 
 

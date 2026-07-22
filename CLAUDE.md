@@ -85,15 +85,26 @@ notes, distinguishing features, and a confidence level. The system prompt explic
 its own visual read over the local classifier's guess when they disagree, and to return `null` for
 brand/model number rather than guess.
 
-**`src/agents/pricing_subagent.py`** — calls the Claude API with the `web_search_20260209` server-side tool.
-`PricingSubagent.research_price(identification)` sends the `ProductIdentification` as context and instructs
-Claude to search for real sold/completed comps (not asking prices) across a few search phrasings, then
-return a single raw JSON object matching `PricingRecommendation` (suggested price, price range, comparable
-listings, reasoning, confidence). Structured outputs (`output_format=`) aren't used here — tool use plus
-`output_config.format` in the same request is a combination worth double-checking against the current API
-docs before relying on it, so this instead prompts for raw JSON and validates it via
-`PricingRecommendation.model_validate()` after a small `_extract_json` cleanup step (strips markdown code
-fences models sometimes add despite being told not to).
+**`src/agents/pricing_subagent.py`** — calls the Claude API, sourcing pricing from eBay only (never general
+web results). `PricingSubagent.research_price(identification)` builds eBay's own sold-listings search URLs
+(`ebay.com/sch/i.html?_nkw=<query>&LH_Sold=1&LH_Complete=1`) from the identification in Python and embeds
+them directly in the prompt — `web_fetch` can only retrieve URLs already present in the conversation, so
+these are constructed ourselves rather than left for Claude to guess at. Claude fetches those (via
+`web_fetch_20260209`, `allowed_domains: ["ebay.com"]`) and reads the actual sold listings; `web_search_20260209`
+(same domain restriction) is available as a fallback if the direct URLs come up empty. Each comparable
+listing carries an explicit `listing_type: "sold" | "active"` so the sold-vs-active distinction is a
+structured field, not just implied by prose reasoning — the model is instructed to fall back to active
+listings only when it truly can't find sold comps, and to cap `pricing_confidence` accordingly when it does.
+
+Structured outputs (`output_format=`) aren't used here — tool use plus `output_config.format` in the same
+request is a combination worth double-checking against the current API docs before relying on it — so this
+instead prompts for raw JSON and validates it via `PricingRecommendation.model_validate()` after a small
+`_extract_json` cleanup step (strips markdown code fences models sometimes add despite being told not to).
+**Take the LAST text block from `response.content`, not the first.** With multiple tool-call rounds (fetch,
+possibly search too), Claude often emits an early text block like "Let me check eBay's sold listings..."
+before any tool use; grabbing the first text block gets that commentary instead of the final JSON-only
+answer, and fails with a JSON parse error that looks identical to a genuinely empty response. This was a
+real bug caught via a production traceback, not a hypothetical.
 
 **`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
 (git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp), runs the local classifier +
