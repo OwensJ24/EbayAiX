@@ -140,7 +140,13 @@ class PricingSubagent:
 
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=2048,
+            # NOTE: max_tokens caps output tokens for the whole multi-round tool-use
+            # turn (interim commentary + tool-call params + final JSON), not just
+            # the final answer — it does NOT affect input-token cost, so lowering it
+            # doesn't help the actual cost problem (uncapped fetched page content).
+            # Too low a value here cuts the response off before the final JSON
+            # ever gets emitted. Keep this at a comfortable size.
+            max_tokens=4096,
             system=_SYSTEM_PROMPT,
             tools=[
                 {
@@ -173,9 +179,10 @@ class PricingSubagent:
         )
 
         logger.info(
-            "PricingSubagent.research_price token usage: input=%d output=%d",
+            "PricingSubagent.research_price token usage: input=%d output=%d stop_reason=%s",
             response.usage.input_tokens,
             response.usage.output_tokens,
+            response.stop_reason,
         )
 
         # Take the LAST text block, not the first: with multiple tool-call rounds
@@ -184,7 +191,20 @@ class PricingSubagent:
         # the actual JSON-only final answer is whatever text block comes last.
         text_blocks = [block.text for block in response.content if block.type == "text"]
         if not text_blocks:
-            raise RuntimeError("Pricing Subagent returned no text content to parse")
+            if response.stop_reason == "max_tokens":
+                raise RuntimeError(
+                    "Pricing Subagent hit max_tokens before producing any text — "
+                    "the tool-use turn ran out of output budget. Increase max_tokens."
+                )
+            if response.stop_reason == "pause_turn":
+                raise RuntimeError(
+                    "Pricing Subagent's server-side tool-use loop paused (hit eBay's "
+                    "internal iteration cap) without finishing — reduce the number of "
+                    "searches/fetches, or resubmit the paused turn to let it continue."
+                )
+            raise RuntimeError(
+                f"Pricing Subagent returned no text content to parse (stop_reason={response.stop_reason!r})"
+            )
 
         data = _extract_json(text_blocks[-1])
         return PricingRecommendation.model_validate(data)
