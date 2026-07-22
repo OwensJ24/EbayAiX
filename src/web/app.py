@@ -1,4 +1,4 @@
-"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent -> Pricing Subagent."""
+"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent -> eBay comps."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 import anthropic
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.agents.pricing_subagent import PricingSubagent
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
+from src.ebay.browse import search_comparable_listings
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
 
@@ -35,7 +36,6 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # construction are both too expensive to redo per request.
 _preprocessor = VisionPreprocessor()
 _vision_subagent = VisionSubagent()
-_pricing_subagent = PricingSubagent()
 
 
 class RefineRequest(BaseModel):
@@ -130,7 +130,25 @@ def refine(payload: RefineRequest) -> dict:
     return {"status": "complete", "result": identification.model_dump()}
 
 
+def _build_ebay_query(identification: ProductIdentification) -> str:
+    if identification.brand and identification.model_number:
+        return f"{identification.brand} {identification.model_number}"
+    if identification.brand and not identification.item_name.lower().startswith(identification.brand.lower()):
+        return f"{identification.brand} {identification.item_name}"
+    return identification.item_name
+
+
 @app.post("/api/price")
 def price(identification: ProductIdentification) -> dict:
-    pricing = _call_claude(_pricing_subagent.research_price, identification)
-    return {"status": "complete", "result": pricing.model_dump()}
+    query = _build_ebay_query(identification)
+    try:
+        comps = search_comparable_listings(query)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"eBay API error: {e.response.status_code}")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="Could not reach eBay's API. Please try again.")
+
+    return {
+        "status": "complete",
+        "result": {"query": query, "comparable_listings": [c.model_dump() for c in comps]},
+    }

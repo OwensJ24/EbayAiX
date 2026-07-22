@@ -10,11 +10,18 @@ listing. It's built to showcase Agent Architecture Design, Computer Vision (loca
 and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so code should reflect deliberate,
 enterprise-style patterns rather than the shortest path to a working demo.
 
-So far: local image classification, Claude-based structured identification, a Pricing/Research Subagent
-(agentic web search for resale comps), a FastAPI front end chaining all three with a human clarification
-step, and an eBay OAuth 2.0 connect flow. The orchestrator, actual eBay listing-creation calls, and the HITL
+So far: local image classification, Claude-based structured identification, a low-cost eBay comparable-
+listings lookup (no LLM involved), a FastAPI front end chaining all of it with a human clarification step,
+and an eBay OAuth 2.0 connect flow. The orchestrator, actual eBay listing-creation calls, and the HITL
 approval gate in front of them (described below under "Planned architecture") are not yet implemented —
 eBay's Sell APIs themselves haven't been called yet, only the auth handshake.
+
+**History note:** pricing was originally a Claude-based subagent doing agentic web search/fetch against
+eBay's sold-listings pages. It got expensive fast — an uncapped `web_fetch` burned through the entire
+Anthropic account balance in a couple of test runs, because a real eBay search-results page is huge and
+server-side tool results stay in context for every subsequent step within the same request. It was replaced
+outright with the plain `src/ebay/browse.py` approach below per explicit direction: no LLM call for pricing
+at all, just eBay's own Browse API showing a few comparable listings and their asking prices.
 
 ## Commands
 
@@ -46,8 +53,10 @@ SSL_CERT_FILE=$(uv run python -c "import certifi; print(certifi.where())") uv ru
 Only needed once — the ResNet50 weights are then cached under `~/.cache/torch/hub/checkpoints/`.
 
 `EBAY_APP_ID`, `EBAY_CERT_ID`, `EBAY_RU_NAME` (and `EBAY_ENVIRONMENT`, default `sandbox`) must be set in
-`.env` for anything in `src/ebay/` to work. `EBAY_RU_NAME` is not a URL — it's the RuName string eBay
-generates for a registered redirect URI. See `.env.example`.
+`.env` for the OAuth connect flow to work. `EBAY_RU_NAME` is not a URL — it's the RuName string eBay
+generates for a registered redirect URI. Separately, `EBAY_PROD_APP_ID`/`EBAY_PROD_CERT_ID` (your
+**production** keyset, not sandbox) must be set for `src/ebay/browse.py`'s comp search — see .env.example
+and the Architecture section below for why this specifically needs production credentials.
 
 ## Deployment
 
@@ -85,36 +94,21 @@ notes, distinguishing features, and a confidence level. The system prompt explic
 its own visual read over the local classifier's guess when they disagree, and to return `null` for
 brand/model number rather than guess.
 
-**`src/agents/pricing_subagent.py`** — calls the Claude API, sourcing pricing from eBay only (never general
-web results). `PricingSubagent.research_price(identification)` builds eBay's own sold-listings search URLs
-(`ebay.com/sch/i.html?_nkw=<query>&LH_Sold=1&LH_Complete=1`) from the identification in Python and embeds
-them directly in the prompt — `web_fetch` can only retrieve URLs already present in the conversation, so
-these are constructed ourselves rather than left for Claude to guess at. Claude fetches those (via
-`web_fetch_20260209`, `allowed_domains: ["ebay.com"]`) and reads the actual sold listings; `web_search_20260209`
-(same domain restriction) is available as a fallback if the direct URLs come up empty. Each comparable
-listing carries an explicit `listing_type: "sold" | "active"` so the sold-vs-active distinction is a
-structured field, not just implied by prose reasoning — the model is instructed to fall back to active
-listings only when it truly can't find sold comps, and to cap `pricing_confidence` accordingly when it does.
+**`src/ebay/browse.py`** — no Claude involved at all; a plain, cheap eBay Browse API call.
+`search_comparable_listings(query)` gets an application-level access token via the **Client Credentials**
+grant (`get_application_access_token()` — a different, simpler auth flow than the user OAuth handshake
+below: no browser consent step, just a server-to-server token exchange, cached in memory until near
+expiry), then calls `GET /buy/browse/v1/item_summary/search` and returns up to 3 `EbayComp` (title, price,
+currency, condition, item URL). `src/web/app.py`'s `POST /api/price` builds the search query from the
+`ProductIdentification` (`{brand} {model_number}` when both are present, falling back to item name) and
+returns the comps directly — no LLM call, no token cost beyond the eBay API request itself.
 
-Structured outputs (`output_format=`) aren't used here — tool use plus `output_config.format` in the same
-request is a combination worth double-checking against the current API docs before relying on it — so this
-instead prompts for raw JSON and validates it via `PricingRecommendation.model_validate()` after a small
-`_extract_json` cleanup step (strips markdown code fences models sometimes add despite being told not to).
-
-**Cost controls (load-bearing, not optional):** a real eBay search-results page is huge — dozens of listing
-cards, sponsored content, scripts-as-text — and server-side tool results stay in context for every
-subsequent step within the same request, so an uncapped fetch compounds fast. This burned through the whole
-Anthropic account balance in a couple of test runs before these caps existed. `web_fetch`'s
-`max_content_tokens` (default 3000, constructor arg) caps each fetched page; `_build_search_queries()` caps
-at 2 URLs (fewer fetch calls); `web_search`'s `max_uses` defaults to 2. Don't raise any of these without a
-specific reason — they're the actual limiter, not a suggestion. `research_price()` logs
-`response.usage.input_tokens`/`output_tokens` via the standard `logging` module after every call
-(`PricingSubagent.research_price` logger) so token spend per request stays visible.
-**Take the LAST text block from `response.content`, not the first.** With multiple tool-call rounds (fetch,
-possibly search too), Claude often emits an early text block like "Let me check eBay's sold listings..."
-before any tool use; grabbing the first text block gets that commentary instead of the final JSON-only
-answer, and fails with a JSON parse error that looks identical to a genuinely empty response. This was a
-real bug caught via a production traceback, not a hypothetical.
+**Always uses PRODUCTION eBay credentials** (`EBAY_PROD_APP_ID`/`EBAY_PROD_CERT_ID`), regardless of the rest
+of the app's `EBAY_ENVIRONMENT` setting. eBay's sandbox environment has essentially no real search/catalog
+data — `item_summary/search` reliably returns `total: 0` there, a well-documented, longstanding eBay
+limitation (confirmed against multiple independent developer reports), not a bug in this code. This is a
+read-only, public-data search with no side effects, so production credentials here carry none of the risk
+that using production for listing creation would.
 
 **`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
 (git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp), runs the local classifier +
@@ -124,23 +118,25 @@ disk. The frontend (`src/web/static/index.html`, vanilla JS) then prompts the us
 posts it to `POST /api/identify/refine`, which re-runs `VisionSubagent.identify(..., user_provided_name=...)`
 with that hint folded into the prompt and always returns a final result (no further clarification loop).
 Both endpoints delete the uploaded file once they return a final result. Once identification is final, the
-frontend shows a "Get Price Estimate" button that posts the `ProductIdentification` (FastAPI validates the
-JSON body directly against that Pydantic model) to `POST /api/price`, which runs the Pricing Subagent. The
-`VisionPreprocessor`/`VisionSubagent`/`PricingSubagent` instances are all constructed once at module import
-time and reused across requests — re-instantiating per request would reload the ResNet50 weights every
-call. `_call_claude()` wraps every subagent call and translates `OverloadedError`/`RateLimitError`/
-`APIConnectionError`/`APIStatusError` into a clean `503`/`502` HTTP response instead of a bare 500 — this
-was added after a real Anthropic-side outage surfaced as an unhandled exception during development.
+frontend shows a "Show Comparable Listings" button that posts the `ProductIdentification` (FastAPI validates
+the JSON body directly against that Pydantic model) to `POST /api/price`, which calls
+`search_comparable_listings()` above. The `VisionPreprocessor`/`VisionSubagent` instances are constructed
+once at module import time and reused across requests — re-instantiating per request would reload the
+ResNet50 weights every call. `_call_claude()` wraps every Claude-backed call (identify/refine — pricing no
+longer uses Claude) and translates `OverloadedError`/`RateLimitError`/`APIConnectionError`/`APIStatusError`
+into a clean `503`/`502` HTTP response instead of a bare 500 — this was added after a real Anthropic-side
+outage surfaced as an unhandled exception during development.
 
-**`src/ebay/`** — eBay OAuth 2.0 (authorization-code grant for user access tokens), no listing calls yet.
-`config.py` loads `EbayConfig` from env and resolves sandbox vs. production base/token/authorize URLs.
-`oauth.py` builds the consent URL and does the `authorization_code`/`refresh_token` exchanges against
+**`src/ebay/`** — two independent pieces. **User OAuth 2.0** (authorization-code grant, no listing calls
+yet): `config.py`'s `EbayConfig`/`load_ebay_config()` resolves sandbox vs. production base/token/authorize
+URLs; `oauth.py` builds the consent URL and does the `authorization_code`/`refresh_token` exchanges against
 eBay's Identity API (`EbayTokens` tracks both tokens' expiry; eBay doesn't rotate the refresh token on
-refresh). `token_store.py` persists tokens to git-ignored `data/ebay_tokens.json` (single-user, local/small
+refresh); `token_store.py` persists tokens to git-ignored `data/ebay_tokens.json` (single-user, local/small
 deployment — not a multi-tenant design) and exposes `get_valid_access_token()`, which transparently
-refreshes an expired access token before returning it. `src/web/ebay_routes.py` wires this into FastAPI:
+refreshes an expired access token before returning it; `src/web/ebay_routes.py` wires this into FastAPI:
 `GET /ebay/connect` (redirect to eBay, with CSRF `state`), `GET /ebay/callback` (code -> tokens), `GET
-/ebay/status`.
+/ebay/status`. **Application-level Browse API access** (separate, see `browse.py` above): `config.py`'s
+`EbayBrowseConfig`/`load_ebay_browse_config()`, always production, no user consent involved.
 
 **Package layout is deliberate:** `src/`, `src/ml/`, `src/agents/`, `src/web/`, `src/ebay/` have no
 `__init__.py` — they work as Python 3.14 implicit namespace packages. Do not add empty `__init__.py` files
@@ -149,6 +145,7 @@ back in; only add one if it needs to hold real code.
 ### Planned architecture (not yet built)
 
 Per the original design: a hierarchical Orchestrator-Workers pattern where a Claude-based orchestrator
-routes between the Vision Subagent, the Pricing Subagent (both above), and eBay Sell REST API calls (using
-the OAuth tokens `src/ebay/` already handles) to create draft listings — gated behind a mandatory
-Human-in-the-Loop manual approval step before any live write to eBay.
+routes between the Vision Subagent (above) and eBay Sell REST API calls (using the OAuth tokens `src/ebay/`
+already handles) to create draft listings — gated behind a mandatory Human-in-the-Loop manual approval step
+before any live write to eBay. Pricing (`browse.py`) is intentionally plain eBay API + Python, not an
+orchestrated subagent — no LLM reasoning involved.

@@ -36,7 +36,7 @@
     <input type="text" id="itemNameInput" placeholder="e.g. Sony WH-1000XM4 headphones">
     <button id="submitClarification">Continue</button>
   </div>
-  <button id="priceButton" style="display:none;">Get Price Estimate</button>
+  <button id="priceButton" style="display:none;">Show Comparable Listings</button>
   <div id="priceStatus"></div>
 
   <script>
@@ -130,7 +130,7 @@
       if (!currentIdentification) return;
 
       priceButton.disabled = true;
-      priceStatusEl.textContent = 'Researching comparable sold prices…';
+      priceStatusEl.textContent = 'Looking up comparable eBay listings…';
 
       fetch('/api/price', {
         method: 'POST',
