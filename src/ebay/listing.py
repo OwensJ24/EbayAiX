@@ -9,6 +9,8 @@ manually publish from eBay's own Seller Hub.
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 from pydantic import BaseModel
 
@@ -16,6 +18,8 @@ from src.agents.vision_subagent import ProductIdentification
 from src.ebay.browse import build_query
 from src.ebay.config import EbayConfig, load_ebay_config
 from src.ebay.token_store import get_valid_access_token
+
+logger = logging.getLogger(__name__)
 
 _MARKETPLACE_ID = "EBAY_US"
 _CATEGORY_TREE_ID = "0"  # EBAY_US
@@ -66,17 +70,25 @@ def create_or_replace_inventory_item(
     config: EbayConfig, token: str, sku: str, identification: ProductIdentification, image_url: str, quantity: int = 1
 ) -> None:
     payload = _build_inventory_item_payload(identification, image_url, quantity)
+    headers = {**_auth_headers(token), "Content-Language": "en-US", "Accept-Language": "en-US"}
+
+    logger.info(
+        "createOrReplaceInventoryItem request: url=%s headers=%s payload=%s",
+        f"{config.api_base}/sell/inventory/v1/inventory_item/{sku}",
+        {k: v for k, v in headers.items() if k != "Authorization"},
+        payload,
+    )
     response = httpx.put(
         f"{config.api_base}/sell/inventory/v1/inventory_item/{sku}",
-        # Content-Language is the header eBay's own docs require here. Accept-Language
-        # is added too: eBay's "Invalid value for header Content-Language" (error
-        # 25709) is a well-documented, cross-platform (Node.js/C#/Power Automate) case
-        # of a misleading error message — multiple independent reports found sending
-        # both headers resolves it, including cases where the real cause clearly
-        # wasn't the header value itself (still failed even with it removed entirely).
-        headers={**_auth_headers(token), "Content-Language": "en-US", "Accept-Language": "en-US"},
+        headers=headers,
         json=payload,
         timeout=20.0,
+    )
+    logger.info(
+        "createOrReplaceInventoryItem response: status=%d headers=%s body=%s",
+        response.status_code,
+        dict(response.headers),
+        response.text,
     )
     response.raise_for_status()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -19,6 +20,11 @@ from src.ebay.browse import build_query, search_comparable_listings
 from src.ebay.listing import create_draft_listing
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
+
+# INFO-level logs (e.g. src.ebay.listing's request/response diagnostics) are silently
+# dropped otherwise — Python's root logger defaults to WARNING, and nothing else in
+# this app configures logging.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 T = TypeVar("T")
 
@@ -145,7 +151,15 @@ def _call_ebay(fn: Callable[..., T], *args, **kwargs) -> T:
         # this for missing env vars or a not-yet-connected eBay account.
         raise HTTPException(status_code=400, detail=str(e))
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"eBay API error: {e.response.status_code} {e.response.text[:300]}")
+        request_id = (
+            e.response.headers.get("X-EBAY-C-REQUEST-ID")
+            or e.response.headers.get("x-ebay-request-id")
+            or e.response.headers.get("rlogid")
+        )
+        detail = f"eBay API error: {e.response.status_code} {e.response.text[:300]}"
+        if request_id:
+            detail += f" (eBay request id: {request_id})"
+        raise HTTPException(status_code=502, detail=detail)
     except httpx.HTTPError:
         raise HTTPException(status_code=503, detail="Could not reach eBay's API. Please try again.")
 
