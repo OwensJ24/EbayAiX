@@ -14,9 +14,11 @@
   .error { color: #b00020; }
   pre { background: #f5f5f5; padding: 1rem; border-radius: 6px; overflow-x: auto; }
   button { padding: 0.5rem 1rem; margin-top: 0.5rem; cursor: pointer; }
-  input[type="text"] { padding: 0.4rem; width: 100%; box-sizing: border-box; margin-top: 0.5rem; }
+  input[type="text"], input[type="number"] { padding: 0.4rem; width: 100%; box-sizing: border-box; margin-top: 0.5rem; }
   #ebayStatus { font-size: 0.9rem; margin-bottom: 1.5rem; }
   #ebayStatus a { margin-left: 0.5rem; }
+  .warning { background: #fff8e1; border: 1px solid #e0c060; border-radius: 6px; padding: 0.75rem 1rem; margin-top: 0.5rem; }
+  label { display: block; margin-top: 1rem; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -39,6 +41,13 @@
   <button id="priceButton" style="display:none;">Show Comparable Listings</button>
   <div id="priceStatus"></div>
 
+  <div id="draftSection" style="display:none;">
+    <label for="priceInput">Listing price (USD)</label>
+    <input type="number" id="priceInput" min="0.01" step="0.01">
+    <button id="draftButton">Create Draft Listing</button>
+    <div id="draftStatus"></div>
+  </div>
+
   <script>
     const MAX_BYTES = 10 * 1024 * 1024;
     const dropzone = document.getElementById('dropzone');
@@ -50,6 +59,10 @@
     const submitClarificationBtn = document.getElementById('submitClarification');
     const priceButton = document.getElementById('priceButton');
     const priceStatusEl = document.getElementById('priceStatus');
+    const draftSection = document.getElementById('draftSection');
+    const priceInput = document.getElementById('priceInput');
+    const draftButton = document.getElementById('draftButton');
+    const draftStatusEl = document.getElementById('draftStatus');
 
     let currentUploadId = null;
     let currentIdentification = null;
@@ -84,6 +97,8 @@
       clarificationEl.style.display = 'none';
       priceButton.style.display = 'none';
       priceStatusEl.innerHTML = '';
+      draftSection.style.display = 'none';
+      draftStatusEl.innerHTML = '';
       currentUploadId = null;
       currentIdentification = null;
 
@@ -112,10 +127,11 @@
     }
 
     function handleResponse(data) {
+      currentUploadId = data.upload_id;
       if (data.status === 'needs_clarification') {
-        currentUploadId = data.upload_id;
         currentIdentification = null;
         priceButton.style.display = 'none';
+        draftSection.style.display = 'none';
         statusEl.innerHTML = `<p>Best guess so far:</p><pre>${JSON.stringify(data.result, null, 2)}</pre>`;
         clarificationEl.style.display = 'block';
       } else {
@@ -144,12 +160,61 @@
         })
         .then((data) => {
           priceStatusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
+
+          const comps = data.result.comparable_listings || [];
+          if (comps.length) {
+            const avg = comps.reduce((sum, c) => sum + c.price, 0) / comps.length;
+            priceInput.value = avg.toFixed(2);
+          }
+          draftStatusEl.innerHTML = '';
+          draftSection.style.display = 'block';
         })
         .catch((err) => {
           priceStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
         })
         .finally(() => {
           priceButton.disabled = false;
+        });
+    });
+
+    draftButton.addEventListener('click', () => {
+      if (!currentIdentification || !currentUploadId) return;
+
+      const price = parseFloat(priceInput.value);
+      if (!(price > 0)) {
+        draftStatusEl.innerHTML = '<p class="error">Enter a price greater than 0.</p>';
+        return;
+      }
+
+      draftButton.disabled = true;
+      draftStatusEl.textContent = 'Creating draft listing on eBay…';
+
+      fetch('/api/listing/draft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identification: currentIdentification, upload_id: currentUploadId, price }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then((data) => {
+          const r = data.result;
+          let html = `<p>Draft created — SKU <code>${r.sku}</code>, offer <code>${r.offer_id}</code>.</p>`;
+          html += `<p><a href="${r.seller_hub_url}" target="_blank" rel="noopener">Open in eBay Seller Hub</a></p>`;
+          if (r.missing.length) {
+            html += `<div class="warning"><strong>Still needed before you can publish:</strong><ul>`;
+            html += r.notes.map((n) => `<li>${n}</li>`).join('');
+            html += `</ul></div>`;
+          }
+          draftStatusEl.innerHTML = html;
+        })
+        .catch((err) => {
+          draftStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          draftButton.disabled = false;
         });
     });
 

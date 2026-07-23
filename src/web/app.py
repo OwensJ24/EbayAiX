@@ -1,20 +1,22 @@
-"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent -> eBay comps."""
+"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent -> eBay comps/listing."""
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
 
 import anthropic
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
-from src.ebay.browse import search_comparable_listings
+from src.ebay.browse import build_query, search_comparable_listings
+from src.ebay.listing import create_draft_listing
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
 
@@ -31,6 +33,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="AgentX")
 app.include_router(ebay_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Loaded once at process startup — ResNet50 weight loading and API client
 # construction are both too expensive to redo per request.
@@ -108,8 +111,10 @@ def identify(file: UploadFile = File(...)) -> dict:
             "result": identification.model_dump(),
         }
 
-    path.unlink(missing_ok=True)
-    return {"status": "complete", "result": identification.model_dump()}
+    # File is kept (not deleted) so a later draft-listing step can reference the
+    # image — it's only cleaned up once a draft is actually created, or if this
+    # request itself fails (see the except block above).
+    return {"status": "complete", "upload_id": path.stem, "result": identification.model_dump()}
 
 
 @app.post("/api/identify/refine")
@@ -124,31 +129,59 @@ def refine(payload: RefineRequest) -> dict:
         identification = _call_claude(
             _vision_subagent.identify, path, local_result, user_provided_name=payload.item_name
         )
-    finally:
+    except Exception:
         path.unlink(missing_ok=True)
+        raise
 
-    return {"status": "complete", "result": identification.model_dump()}
+    return {"status": "complete", "upload_id": path.stem, "result": identification.model_dump()}
 
 
-def _build_ebay_query(identification: ProductIdentification) -> str:
-    if identification.brand and identification.model_number:
-        return f"{identification.brand} {identification.model_number}"
-    if identification.brand and not identification.item_name.lower().startswith(identification.brand.lower()):
-        return f"{identification.brand} {identification.item_name}"
-    return identification.item_name
+def _call_ebay(fn: Callable[..., T], *args, **kwargs) -> T:
+    """Run an eBay-backed call, translating failures into clean HTTP errors."""
+    try:
+        return fn(*args, **kwargs)
+    except RuntimeError as e:
+        # load_ebay_config()/load_ebay_browse_config()/get_valid_access_token() raise
+        # this for missing env vars or a not-yet-connected eBay account.
+        raise HTTPException(status_code=400, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"eBay API error: {e.response.status_code} {e.response.text[:300]}")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="Could not reach eBay's API. Please try again.")
 
 
 @app.post("/api/price")
 def price(identification: ProductIdentification) -> dict:
-    query = _build_ebay_query(identification)
-    try:
-        comps = search_comparable_listings(query)
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"eBay API error: {e.response.status_code}")
-    except httpx.HTTPError:
-        raise HTTPException(status_code=503, detail="Could not reach eBay's API. Please try again.")
-
+    query = build_query(identification)
+    comps = _call_ebay(search_comparable_listings, query)
     return {
         "status": "complete",
         "result": {"query": query, "comparable_listings": [c.model_dump() for c in comps]},
     }
+
+
+class DraftListingRequest(BaseModel):
+    identification: ProductIdentification
+    upload_id: str
+    price: float
+    currency: str = "USD"
+
+
+def _public_base_url(request: Request) -> str:
+    override = os.environ.get("PUBLIC_BASE_URL")
+    return override.rstrip("/") if override else str(request.base_url).rstrip("/")
+
+
+@app.post("/api/listing/draft")
+def create_draft_listing_route(payload: DraftListingRequest, request: Request) -> dict:
+    matches = list(UPLOAD_DIR.glob(f"{payload.upload_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Upload not found — it may have already been used or the server restarted")
+    path = matches[0]
+
+    image_url = f"{_public_base_url(request)}/uploads/{path.name}"
+    result = _call_ebay(
+        create_draft_listing, payload.identification, payload.upload_id, image_url, payload.price, payload.currency
+    )
+    path.unlink(missing_ok=True)
+    return {"status": "complete", "result": result.model_dump()}

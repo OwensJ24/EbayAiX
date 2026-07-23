@@ -16,6 +16,10 @@ _PRODUCTION_AUTH_BASE = "https://auth.ebay.com"
 
 # Scope needed to create/manage draft listings via the Sell Inventory API.
 SELL_INVENTORY_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.inventory"
+# Read-only scope for fetching existing business policies/merchant location, so a
+# draft listing can include them when the account already has them set up.
+SELL_ACCOUNT_READONLY_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.account.readonly"
+DEFAULT_SCOPES: tuple[str, ...] = (SELL_INVENTORY_SCOPE, SELL_ACCOUNT_READONLY_SCOPE)
 
 _REQUIRED_ENV_VARS = ("EBAY_APP_ID", "EBAY_CERT_ID", "EBAY_RU_NAME")
 

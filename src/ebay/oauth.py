@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from src.ebay.config import SELL_INVENTORY_SCOPE, EbayConfig
+from src.ebay.config import DEFAULT_SCOPES, EbayConfig
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class EbayTokens:
 def build_authorize_url(
     config: EbayConfig,
     state: str | None = None,
-    scopes: tuple[str, ...] = (SELL_INVENTORY_SCOPE,),
+    scopes: tuple[str, ...] = DEFAULT_SCOPES,
 ) -> str:
     params = {
         "client_id": config.app_id,
@@ -69,7 +69,7 @@ def exchange_code_for_tokens(config: EbayConfig, code: str) -> EbayTokens:
 def refresh_access_token(
     config: EbayConfig,
     tokens: EbayTokens,
-    scopes: tuple[str, ...] = (SELL_INVENTORY_SCOPE,),
+    scopes: tuple[str, ...] = DEFAULT_SCOPES,
 ) -> EbayTokens:
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",

@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import base64
 import time
+from typing import TYPE_CHECKING
 
 import httpx
 from pydantic import BaseModel
 
 from src.ebay.config import EbayBrowseConfig, load_ebay_browse_config
+
+if TYPE_CHECKING:
+    from src.agents.vision_subagent import ProductIdentification
 
 _APPLICATION_SCOPE = "https://api.ebay.com/oauth/api_scope"
 _MARKETPLACE_ID = "EBAY_US"
@@ -36,6 +40,19 @@ class EbayComp(BaseModel):
     currency: str
     condition: str | None = None
     item_url: str | None = None
+
+
+def build_query(identification: "ProductIdentification") -> str:
+    """Build a reasonable eBay search query from an item identification.
+
+    Shared by /api/price (comp search) and the Taxonomy API category lookup in
+    listing.py, so both use identical query logic.
+    """
+    if identification.brand and identification.model_number:
+        return f"{identification.brand} {identification.model_number}"
+    if identification.brand and not identification.item_name.lower().startswith(identification.brand.lower()):
+        return f"{identification.brand} {identification.item_name}"
+    return identification.item_name
 
 
 def _basic_auth_header(config: EbayBrowseConfig) -> str:
