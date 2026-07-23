@@ -68,7 +68,13 @@ def create_or_replace_inventory_item(
     payload = _build_inventory_item_payload(identification, image_url, quantity)
     response = httpx.put(
         f"{config.api_base}/sell/inventory/v1/inventory_item/{sku}",
-        headers={**_auth_headers(token), "Content-Language": "en-US"},
+        # Content-Language is the header eBay's own docs require here. Accept-Language
+        # is added too: eBay's "Invalid value for header Content-Language" (error
+        # 25709) is a well-documented, cross-platform (Node.js/C#/Power Automate) case
+        # of a misleading error message — multiple independent reports found sending
+        # both headers resolves it, including cases where the real cause clearly
+        # wasn't the header value itself (still failed even with it removed entirely).
+        headers={**_auth_headers(token), "Content-Language": "en-US", "Accept-Language": "en-US"},
         json=payload,
         timeout=20.0,
     )
