@@ -35,7 +35,18 @@ _CONDITION_MAP: dict[str, str] = {
 
 
 def _auth_headers(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # Content-Language is required on every Sell Inventory API call that writes data
+    # (createOrReplaceInventoryItem AND createOffer) — eBay's error for a *missing*
+    # Content-Language header confusingly says "Invalid value for header
+    # Content-Language" (error 25709) rather than something like "header required",
+    # which is what sent us chasing the wrong call and the wrong fix at first.
+    # Applying it to every call (including GETs, which ignore it) is simplest and safe.
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Content-Language": "en-US",
+        "Accept-Language": "en-US",
+    }
 
 
 def generate_sku(upload_id: str) -> str:
@@ -70,7 +81,7 @@ def create_or_replace_inventory_item(
     config: EbayConfig, token: str, sku: str, identification: ProductIdentification, image_url: str, quantity: int = 1
 ) -> None:
     payload = _build_inventory_item_payload(identification, image_url, quantity)
-    headers = {**_auth_headers(token), "Content-Language": "en-US", "Accept-Language": "en-US"}
+    headers = _auth_headers(token)
 
     logger.info(
         "createOrReplaceInventoryItem request: url=%s headers=%s payload=%s",
