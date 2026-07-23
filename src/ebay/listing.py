@@ -106,7 +106,11 @@ def suggest_category_id(config: EbayConfig, token: str, query: str) -> str | Non
         if not suggestions:
             return None
         return suggestions[0]["category"]["categoryId"]
-    except (httpx.HTTPError, KeyError, IndexError):
+    except httpx.HTTPStatusError as e:
+        logger.info("suggest_category_id degraded: %d %s", e.response.status_code, e.response.text[:300])
+        return None
+    except (httpx.HTTPError, KeyError, IndexError) as e:
+        logger.info("suggest_category_id degraded: %r", e)
         return None
 
 
@@ -123,7 +127,11 @@ def get_merchant_location_key(config: EbayConfig, token: str) -> str | None:
         if data.get("total", 0) < 1:
             return None
         return data["locations"][0]["merchantLocationKey"]
-    except (httpx.HTTPError, KeyError, IndexError):
+    except httpx.HTTPStatusError as e:
+        logger.info("get_merchant_location_key degraded: %d %s", e.response.status_code, e.response.text[:300])
+        return None
+    except (httpx.HTTPError, KeyError, IndexError) as e:
+        logger.info("get_merchant_location_key degraded: %r", e)
         return None
 
 
@@ -148,8 +156,10 @@ def get_listing_policies(config: EbayConfig, token: str) -> dict[str, str]:
             items = response.json().get(list_key, [])
             if items:
                 policies[offer_key] = items[0][id_key]
-        except (httpx.HTTPError, KeyError, IndexError):
-            continue
+        except httpx.HTTPStatusError as e:
+            logger.info("get_listing_policies(%s) degraded: %d %s", endpoint, e.response.status_code, e.response.text[:300])
+        except (httpx.HTTPError, KeyError, IndexError) as e:
+            logger.info("get_listing_policies(%s) degraded: %r", endpoint, e)
     return policies
 
 
@@ -190,11 +200,18 @@ def create_offer(
     listing_policies: dict[str, str],
 ) -> str:
     payload = _build_offer_payload(sku, price, currency, quantity, category_id, merchant_location_key, listing_policies)
+    logger.info("createOffer request: url=%s payload=%s", f"{config.api_base}/sell/inventory/v1/offer", payload)
     response = httpx.post(
         f"{config.api_base}/sell/inventory/v1/offer",
         headers=_auth_headers(token),
         json=payload,
         timeout=20.0,
+    )
+    logger.info(
+        "createOffer response: status=%d headers=%s body=%s",
+        response.status_code,
+        dict(response.headers),
+        response.text,
     )
     response.raise_for_status()
     return response.json()["offerId"]
