@@ -49,6 +49,14 @@ class VisionPreprocessor:
         self.top_k = top_k
         self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
 
+        # PyTorch's default CPU intra-op threading spawns one thread per core, which
+        # on a small memory-constrained container (e.g. Render's free tier) adds
+        # unnecessary per-inference memory/thread overhead — especially painful if
+        # more than one inference ends up running concurrently. Capped to 1 since
+        # request-level concurrency is already serialized in app.py.
+        if self.device == "cpu":
+            torch.set_num_threads(1)
+
         self.weights = ResNet50_Weights.DEFAULT
         self.model = resnet50(weights=self.weights).to(self.device).eval()
         self.transforms = self.weights.transforms()

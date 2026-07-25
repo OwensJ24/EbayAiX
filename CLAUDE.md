@@ -130,6 +130,16 @@ successfully created (`POST /api/listing/draft`, see below) or the identify/refi
 user who abandons the flow after identifying but before creating a draft leaves an orphaned file in
 `data/uploads/`; no cleanup job exists for this (accepted tradeoff, not a bug).
 
+**Local ResNet50 inference is serialized across requests via `_inference_lock` (a plain `threading.Lock`).**
+Each sync FastAPI route runs in its own thread-pool thread, so without this, multiple images uploaded in
+quick succession would run CPU inference concurrently — observed causing real OOM crashes on Render's
+free-tier memory limit, since each PyTorch CPU inference pass is memory-hungry enough that 2-3 running at
+once exceeds it. The lock only wraps `_preprocessor.classify()`, not the (network-bound) Claude call, so
+those still run concurrently. `VisionPreprocessor.__init__` also sets `torch.set_num_threads(1)` on CPU to
+cut per-inference thread/memory overhead further. The frontend adds a client-side guard on top (disables the
+dropzone/refine button while a request is in flight) so this is defense-in-depth, not the only line of
+defense — a different client hitting the API directly still can't cause concurrent local inference.
+
 Once identification is final, the frontend shows a "Show Comparable Listings" button that posts the
 `ProductIdentification` (FastAPI validates the JSON body directly against that Pydantic model) to
 `POST /api/price`, which calls `search_comparable_listings()` above using a query built by

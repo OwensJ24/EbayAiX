@@ -9,6 +9,7 @@
   h1 { font-size: 1.4rem; }
   #dropzone { border: 2px dashed #999; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; }
   #dropzone.drag { border-color: #333; background: #f5f5f5; }
+  #dropzone.busy { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
   #status { margin-top: 1rem; white-space: pre-wrap; }
   #preview { max-width: 100%; max-height: 300px; margin-top: 1rem; display: none; }
   .error { color: #b00020; }
@@ -66,6 +67,7 @@
 
     let currentUploadId = null;
     let currentIdentification = null;
+    let isUploading = false;
 
     const ebayStatusEl = document.getElementById('ebayStatus');
     fetch('/ebay/status')
@@ -81,19 +83,27 @@
       })
       .catch(() => { ebayStatusEl.textContent = 'eBay: status unavailable'; });
 
-    dropzone.addEventListener('click', () => fileInput.click());
-    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
+    dropzone.addEventListener('click', () => { if (!isUploading) fileInput.click(); });
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); if (!isUploading) dropzone.classList.add('drag'); });
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
     dropzone.addEventListener('drop', (e) => {
       e.preventDefault();
       dropzone.classList.remove('drag');
+      if (isUploading) return;
       if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
     });
     fileInput.addEventListener('change', () => {
+      if (isUploading) return;
       if (fileInput.files.length) handleFile(fileInput.files[0]);
     });
 
     function handleFile(file) {
+      // Prevents piling up concurrent /api/identify requests (e.g. dragging several
+      // images in quick succession) — each one runs a memory-heavy local ResNet50
+      // inference pass, and running multiple at once was crashing the server with
+      // an out-of-memory error on Render's constrained free tier.
+      if (isUploading) return;
+
       clarificationEl.style.display = 'none';
       priceButton.style.display = 'none';
       priceStatusEl.innerHTML = '';
@@ -113,6 +123,8 @@
       const formData = new FormData();
       formData.append('file', file);
 
+      isUploading = true;
+      dropzone.classList.add('busy');
       statusEl.textContent = 'Identifying…';
       fetch('/api/identify', { method: 'POST', body: formData })
         .then(async (res) => {
@@ -123,6 +135,10 @@
         .then(handleResponse)
         .catch((err) => {
           statusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          isUploading = false;
+          dropzone.classList.remove('busy');
         });
     }
 
@@ -240,9 +256,12 @@
     });
 
     submitClarificationBtn.addEventListener('click', () => {
+      if (isUploading) return;
       const itemName = itemNameInput.value.trim();
       if (!itemName || !currentUploadId) return;
 
+      isUploading = true;
+      submitClarificationBtn.disabled = true;
       statusEl.textContent = 'Refining…';
       clarificationEl.style.display = 'none';
 
@@ -259,6 +278,10 @@
         .then(handleResponse)
         .catch((err) => {
           statusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          isUploading = false;
+          submitClarificationBtn.disabled = false;
         });
     });
   </script>

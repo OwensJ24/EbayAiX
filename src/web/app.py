@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -47,6 +48,15 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # construction are both too expensive to redo per request.
 _preprocessor = VisionPreprocessor()
 _vision_subagent = VisionSubagent()
+
+# Serializes local ResNet50 inference across requests. Each `/api/identify` call
+# runs in its own thread-pool thread (FastAPI's default for sync routes), so
+# multiple images uploaded in quick succession would otherwise run CPU inference
+# concurrently — each pass is memory-hungry enough that 2-3 at once can exceed a
+# constrained container's memory limit (observed causing OOM crashes on Render's
+# free tier). This queues them instead of running them in parallel; Claude API
+# calls afterward are network-bound and stay unserialized.
+_inference_lock = threading.Lock()
 
 
 class RefineRequest(BaseModel):
@@ -106,7 +116,8 @@ def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
 def identify(file: UploadFile = File(...)) -> dict:
     path = _save_upload(file)
     try:
-        local_result = _preprocessor.classify(path)
+        with _inference_lock:
+            local_result = _preprocessor.classify(path)
         identification = _call_claude(_vision_subagent.identify, path, local_result)
     except Exception:
         path.unlink(missing_ok=True)
@@ -133,7 +144,8 @@ def refine(payload: RefineRequest) -> dict:
     path = matches[0]
 
     try:
-        local_result = _preprocessor.classify(path)
+        with _inference_lock:
+            local_result = _preprocessor.classify(path)
         identification = _call_claude(
             _vision_subagent.identify, path, local_result, user_provided_name=payload.item_name
         )
