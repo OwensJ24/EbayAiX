@@ -20,6 +20,12 @@
   #ebayStatus a { margin-left: 0.5rem; }
   .warning { background: #fff8e1; border: 1px solid #e0c060; border-radius: 6px; padding: 0.75rem 1rem; margin-top: 0.5rem; }
   label { display: block; margin-top: 1rem; font-weight: 600; }
+  .listing-preview { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin-top: 0.5rem; }
+  .listing-preview img { max-width: 100%; max-height: 280px; display: block; margin-bottom: 0.75rem; border-radius: 4px; }
+  .listing-preview h3 { margin: 0 0 0.5rem; }
+  .confirm-row { display: flex; align-items: flex-start; gap: 0.5rem; font-weight: normal; margin-top: 1rem; }
+  .confirm-row input[type="checkbox"] { width: auto; margin: 0.2rem 0 0; }
+  .publish-danger { background: #fdeaea; border: 1px solid #d9534f; border-radius: 6px; padding: 0.75rem 1rem; margin-top: 0.5rem; }
 </style>
 </head>
 <body>
@@ -48,6 +54,26 @@
     <div id="draftStatus"></div>
   </div>
 
+  <div id="previewSection" style="display:none;">
+    <label>Review before publishing</label>
+    <div id="listingPreview"></div>
+    <div class="warning" id="draftWarnings" style="display:none;"></div>
+    <p style="font-size:0.85rem;"><a href="#" id="verifyDraftLink">Verify draft via eBay API</a></p>
+    <div id="verifyResult"></div>
+
+    <div class="publish-danger">
+      <strong>Publishing makes this a real, live eBay listing.</strong> It becomes
+      publicly visible and immediately purchasable by real buyers — this is not a
+      reversible preview action.
+    </div>
+    <label class="confirm-row" for="confirmPublish">
+      <input type="checkbox" id="confirmPublish">
+      I understand this will create a real, live eBay listing that buyers can purchase immediately.
+    </label>
+    <button id="publishButton" disabled>Publish to eBay</button>
+    <div id="publishStatus"></div>
+  </div>
+
   <script>
     const MAX_BYTES = 10 * 1024 * 1024;
     const dropzone = document.getElementById('dropzone');
@@ -62,10 +88,25 @@
     const priceInput = document.getElementById('priceInput');
     const draftButton = document.getElementById('draftButton');
     const draftStatusEl = document.getElementById('draftStatus');
+    const previewSection = document.getElementById('previewSection');
+    const listingPreviewEl = document.getElementById('listingPreview');
+    const draftWarningsEl = document.getElementById('draftWarnings');
+    const verifyDraftLink = document.getElementById('verifyDraftLink');
+    const verifyResultEl = document.getElementById('verifyResult');
+    const confirmPublishCheckbox = document.getElementById('confirmPublish');
+    const publishButton = document.getElementById('publishButton');
+    const publishStatusEl = document.getElementById('publishStatus');
 
     let currentUploadId = null;
     let currentIdentification = null;
+    let currentDraftResult = null;
     let isUploading = false;
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str == null ? '' : String(str);
+      return div.innerHTML;
+    }
 
     const ebayStatusEl = document.getElementById('ebayStatus');
     fetch('/ebay/status')
@@ -106,8 +147,14 @@
       priceStatusEl.innerHTML = '';
       draftSection.style.display = 'none';
       draftStatusEl.innerHTML = '';
+      previewSection.style.display = 'none';
+      publishStatusEl.innerHTML = '';
+      verifyResultEl.innerHTML = '';
+      confirmPublishCheckbox.checked = false;
+      publishButton.disabled = true;
       currentUploadId = null;
       currentIdentification = null;
+      currentDraftResult = null;
 
       if (file.size > MAX_BYTES) {
         statusEl.innerHTML = `<p class="error">File is ${(file.size / 1024 / 1024).toFixed(1)}MB — max is 10MB.</p>`;
@@ -209,42 +256,89 @@
           return data;
         })
         .then((data) => {
-          const r = data.result;
-          let html = `<p>Draft created — SKU <code>${r.sku}</code>, offer <code>${r.offer_id}</code>.</p>`;
-          html += `<p><a href="${r.seller_hub_url}" target="_blank" rel="noopener">Open in eBay Seller Hub</a> `;
-          html += `(sandbox's web UI is known to be unreliable — if it doesn't load, use `;
-          html += `<a href="#" id="verifyDraftLink">Verify via API</a> instead)</p>`;
-          if (r.missing.length) {
-            html += `<div class="warning"><strong>Still needed before you can publish:</strong><ul>`;
-            html += r.notes.map((n) => `<li>${n}</li>`).join('');
-            html += `</ul></div>`;
-          }
-          html += `<div id="verifyResult"></div>`;
-          draftStatusEl.innerHTML = html;
-
-          document.getElementById('verifyDraftLink').addEventListener('click', (e) => {
-            e.preventDefault();
-            const verifyResultEl = document.getElementById('verifyResult');
-            verifyResultEl.textContent = 'Fetching offer directly from eBay…';
-            fetch(`/api/listing/draft/${r.offer_id}`)
-              .then(async (res) => {
-                const verifyData = await res.json();
-                if (!res.ok) throw new Error(verifyData.detail || 'Request failed');
-                return verifyData;
-              })
-              .then((verifyData) => {
-                verifyResultEl.innerHTML = `<p>Confirmed — this is what eBay has on file:</p><pre>${JSON.stringify(verifyData.result, null, 2)}</pre>`;
-              })
-              .catch((err) => {
-                verifyResultEl.innerHTML = `<p class="error">${err.message}</p>`;
-              });
-          });
+          currentDraftResult = data.result;
+          draftStatusEl.innerHTML = `<p>Draft created — SKU <code>${escapeHtml(currentDraftResult.sku)}</code>, offer <code>${escapeHtml(currentDraftResult.offer_id)}</code>.</p>`;
+          renderListingPreview(currentDraftResult, price);
+          previewSection.style.display = 'block';
         })
         .catch((err) => {
           draftStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
         })
         .finally(() => {
           draftButton.disabled = false;
+        });
+    });
+
+    function renderListingPreview(draftResult, price) {
+      const id = currentIdentification;
+      const descriptionLines = [id.condition_notes];
+      if (id.distinguishing_features && id.distinguishing_features.length) {
+        descriptionLines.push('Notable features:');
+        id.distinguishing_features.forEach((f) => descriptionLines.push(`- ${f}`));
+      }
+
+      let html = '<div class="listing-preview">';
+      html += `<img src="${preview.src}" alt="listing image">`;
+      html += `<h3>${escapeHtml(id.item_name)}</h3>`;
+      if (id.brand) html += `<p><strong>Brand:</strong> ${escapeHtml(id.brand)}</p>`;
+      html += `<p><strong>Condition:</strong> ${escapeHtml(id.condition)}</p>`;
+      html += `<p><strong>Price:</strong> $${price.toFixed(2)} USD</p>`;
+      html += `<p><strong>Description:</strong></p><pre>${escapeHtml(descriptionLines.join('\n'))}</pre>`;
+      html += '</div>';
+      listingPreviewEl.innerHTML = html;
+
+      if (draftResult.missing.length) {
+        draftWarningsEl.innerHTML = `<strong>Still incomplete:</strong><ul>${draftResult.notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
+        draftWarningsEl.style.display = 'block';
+      } else {
+        draftWarningsEl.style.display = 'none';
+        draftWarningsEl.innerHTML = '';
+      }
+    }
+
+    verifyDraftLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!currentDraftResult) return;
+      verifyResultEl.textContent = 'Fetching offer directly from eBay…';
+      fetch(`/api/listing/draft/${currentDraftResult.offer_id}`)
+        .then(async (res) => {
+          const verifyData = await res.json();
+          if (!res.ok) throw new Error(verifyData.detail || 'Request failed');
+          return verifyData;
+        })
+        .then((verifyData) => {
+          verifyResultEl.innerHTML = `<p>Confirmed — this is what eBay has on file:</p><pre>${JSON.stringify(verifyData.result, null, 2)}</pre>`;
+        })
+        .catch((err) => {
+          verifyResultEl.innerHTML = `<p class="error">${err.message}</p>`;
+        });
+    });
+
+    confirmPublishCheckbox.addEventListener('change', () => {
+      publishButton.disabled = !confirmPublishCheckbox.checked;
+    });
+
+    publishButton.addEventListener('click', () => {
+      if (!currentDraftResult || !confirmPublishCheckbox.checked) return;
+
+      publishButton.disabled = true;
+      confirmPublishCheckbox.disabled = true;
+      publishStatusEl.textContent = 'Publishing to eBay — this will make the listing live…';
+
+      fetch(`/api/listing/publish/${currentDraftResult.offer_id}`, { method: 'POST' })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then((data) => {
+          const r = data.result;
+          publishStatusEl.innerHTML = `<p><strong>Live.</strong> Your listing is now public and purchasable: <a href="${r.listing_url}" target="_blank" rel="noopener">${r.listing_url}</a></p>`;
+        })
+        .catch((err) => {
+          publishStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+          publishButton.disabled = false;
+          confirmPublishCheckbox.disabled = false;
         });
     });
 

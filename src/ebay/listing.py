@@ -1,10 +1,16 @@
-"""eBay Inventory + Offer APIs: create a DRAFT listing (never published).
+"""eBay Inventory + Offer APIs: create a draft listing, then optionally publish it.
 
 Flow: createOrReplaceInventoryItem -> best-effort category/location/policy
-enrichment -> createOffer. Deliberately stops there — publishOffer is never
-called. This boundary is this project's Human-in-the-Loop safety gate for
-eBay writes: the draft sits in the seller's account for a human to review and
-manually publish from eBay's own Seller Hub.
+enrichment -> createOffer -> (separate, explicit step) publishOffer.
+
+eBay's own Seller Hub has no UI at all for reviewing an unpublished offer
+created via the Inventory API (confirmed via eBay developer community
+research) — so the Human-in-the-Loop safety gate for this project lives in
+our own app instead: the frontend shows a full preview of everything that
+will go into the listing, and only an explicit user action calls
+`publish_offer()`. That function is the only place in this codebase that
+calls eBay's publishOffer endpoint, and it makes the listing genuinely live
+and publicly purchasable — not a reversible/staging action.
 """
 
 from __future__ import annotations
@@ -244,15 +250,9 @@ def get_offer(config: EbayConfig, token: str, offer_id: str) -> dict:
     return response.json()
 
 
-def _seller_hub_url(config: EbayConfig) -> str:
-    base = "https://www.sandbox.ebay.com" if config.environment == "sandbox" else "https://www.ebay.com"
-    return f"{base}/sh/lst/drafts"
-
-
 class DraftListingResult(BaseModel):
     sku: str
     offer_id: str
-    seller_hub_url: str
     included: list[str]
     missing: list[str]
     notes: list[str]
@@ -309,8 +309,40 @@ def create_draft_listing(
     return DraftListingResult(
         sku=sku,
         offer_id=offer_id,
-        seller_hub_url=_seller_hub_url(config),
         included=included,
         missing=missing,
         notes=notes,
     )
+
+
+def _listing_url(config: EbayConfig, listing_id: str) -> str:
+    base = "https://www.sandbox.ebay.com" if config.environment == "sandbox" else "https://www.ebay.com"
+    return f"{base}/itm/{listing_id}"
+
+
+class PublishResult(BaseModel):
+    listing_id: str
+    listing_url: str
+
+
+def publish_offer(config: EbayConfig, token: str, offer_id: str) -> PublishResult:
+    """Publish a previously-created offer, making it a real, live, publicly
+    purchasable eBay listing. Everything upstream of this call only staged a
+    draft that was invisible outside eBay's raw API — this is the one
+    genuinely consequential write in this codebase, only ever reached via an
+    explicit user action after reviewing a full preview in our own UI.
+    """
+    response = httpx.post(
+        f"{config.api_base}/sell/inventory/v1/offer/{offer_id}/publish/",
+        headers=_auth_headers(token),
+        timeout=20.0,
+    )
+    logger.info(
+        "publishOffer response: status=%d headers=%s body=%s",
+        response.status_code,
+        dict(response.headers),
+        response.text,
+    )
+    response.raise_for_status()
+    listing_id = response.json()["listingId"]
+    return PublishResult(listing_id=listing_id, listing_url=_listing_url(config, listing_id))

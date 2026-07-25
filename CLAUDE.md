@@ -11,11 +11,20 @@ and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so cod
 enterprise-style patterns rather than the shortest path to a working demo.
 
 So far: local image classification, Claude-based structured identification, a low-cost eBay comparable-
-listings lookup (no LLM involved), eBay draft-listing creation (Inventory Item + Offer, stops before
-Publish), a FastAPI front end chaining all of it with a human clarification step, and an eBay OAuth 2.0
-connect flow. The Claude-based orchestrator tying these steps together programmatically, and a more general
-HITL approval gate, are still future work (see "Planned architecture") — but the concrete "never call
-publishOffer" boundary already built is this project's first real instance of that gate.
+listings lookup (no LLM involved), eBay draft-listing creation (Inventory Item + Offer), an in-app listing
+preview + explicit publish step, a FastAPI front end chaining all of it with a human clarification step, and
+an eBay OAuth 2.0 connect flow. The Claude-based orchestrator tying these steps together programmatically,
+and a more general HITL approval gate, are still future work (see "Planned architecture") — but the in-app
+review-then-publish flow already built is this project's first real instance of that gate.
+
+**Important finding that shaped the publish flow:** eBay's Seller Hub has no UI at all for reviewing an
+unpublished offer created via the Inventory API — confirmed via multiple independent eBay developer
+community threads, not a bug or misconfiguration on this project's side. An earlier version of this project
+linked to a Seller Hub "drafts" URL after creating a draft; that link was based on an incorrect assumption
+and has been removed. Because eBay provides no native review surface for API-created offers, this app's own
+frontend is the Human-in-the-Loop review point: it shows a full preview of everything that will go into the
+listing, and only an explicit, checkbox-gated user action calls `publishOffer` (see `src/ebay/listing.py`
+below) to make it live.
 
 **History note:** pricing was originally a Claude-based subagent doing agentic web search/fetch against
 eBay's sold-listings pages. It got expensive fast — an uncapped `web_fetch` burned through the entire
@@ -150,6 +159,14 @@ the returned comps pre-fills an editable price field, and a "Create Draft Listin
 `GET /uploads/{filename}` (a `StaticFiles` mount — upload IDs are `uuid4().hex`, unguessable enough that
 serving them without auth is an accepted tradeoff for this portfolio project's scale).
 
+Once a draft is created, the frontend renders a full listing preview client-side (image, title, brand,
+condition, price, description — reconstructed from the same `ProductIdentification` data already in memory,
+not re-fetched) plus any `missing`/`notes` gaps from the draft result. This preview, not eBay's Seller Hub, is
+the human review point (see the Seller Hub finding above). Publishing requires checking an explicit
+confirmation checkbox ("I understand this will create a real, live eBay listing...") before the "Publish to
+eBay" button enables; clicking it posts to `POST /api/listing/publish/{offer_id}`, which calls
+`publish_offer()` (see `src/ebay/listing.py` below) and returns a real, public `listing_url` on success.
+
 The `VisionPreprocessor`/`VisionSubagent` instances are constructed once at module import time and reused
 across requests — re-instantiating per request would reload the ResNet50 weights every call. `_call_claude()`
 wraps every Claude-backed call and `_call_ebay()` wraps every eBay-backed call, each translating their
@@ -159,18 +176,25 @@ development; `_call_ebay()` additionally catches the `RuntimeError` that `load_e
 `load_ebay_browse_config()`/`get_valid_access_token()` raise for missing env vars or a not-yet-connected
 eBay account — this used to reach the client as a bare 500 before `_call_ebay()` existed.
 
-**`src/ebay/listing.py`** — creates a DRAFT eBay listing and stops. `create_draft_listing()` orchestrates:
-`createOrReplaceInventoryItem` (PUT — title/description/condition/image/aspects from the
-`ProductIdentification`, condition mapped via `_CONDITION_MAP` to eBay's `ConditionEnum`, `Brand` aspect
-included only when `identification.brand` is set) -> best-effort enrichment (`suggest_category_id()` via the
-Taxonomy API, `get_merchant_location_key()` via the Location API, `get_listing_policies()` via the Account
-API — each independently swallows failures and returns `None`/`{}` rather than raising, since none of these
-are required to create a valid draft, only to *publish* one) -> `createOffer` (POST, `format: "FIXED_PRICE"`,
-omitting `categoryId`/`merchantLocationKey`/`listingPolicies` entirely when not found, never sending them as
-`null`). **`publishOffer` is never called anywhere in this codebase** — grep for it as a guardrail check
-before merging any change that touches this file. The result (`DraftListingResult`) reports which pieces
-were `included` vs. `missing`, with human-readable `notes` for each gap, so the caller can tell the user
-exactly what's left to finish in Seller Hub before they can publish themselves.
+**`src/ebay/listing.py`** — creates a draft eBay listing, and separately, optionally publishes it.
+`create_draft_listing()` orchestrates: `createOrReplaceInventoryItem` (PUT — title/description/condition/
+image/aspects from the `ProductIdentification`, condition mapped via `_CONDITION_MAP` to eBay's
+`ConditionEnum`, `Brand` aspect included only when `identification.brand` is set) -> best-effort enrichment
+(`suggest_category_id()` via the Taxonomy API, `get_merchant_location_key()` via the Location API,
+`get_listing_policies()` via the Account API — each independently swallows failures and returns `None`/`{}`
+rather than raising, since none of these are required to create a valid draft, only to *publish* one) ->
+`createOffer` (POST, `format: "FIXED_PRICE"`, omitting `categoryId`/`merchantLocationKey`/`listingPolicies`
+entirely when not found, never sending them as `null`). The result (`DraftListingResult`) reports which
+pieces were `included` vs. `missing`, with human-readable `notes` for each gap.
+
+`publish_offer(config, token, offer_id)` is a separate, single-purpose function — the only place in this
+codebase that calls eBay's `publishOffer` endpoint (`POST /sell/inventory/v1/offer/{offerId}/publish/`, no
+request body). It's a **real, consequential write**: the listing becomes live and publicly purchasable
+immediately, not a reversible "draft-publish" state. It's only ever reached via `POST
+/api/listing/publish/{offer_id}` in `app.py`, which is only ever called from the frontend's explicit,
+checkbox-gated "Publish to eBay" button — never automatically, never as part of `create_draft_listing()`.
+Grep for `publishOffer`/`publish_offer` as a guardrail check before merging any change that touches this
+file — it should appear in exactly this one function and its call sites, nowhere implicit.
 
 **`src/ebay/`** — three pieces. **User OAuth 2.0** (authorization-code grant): `config.py`'s
 `EbayConfig`/`load_ebay_config()` resolves sandbox vs. production base/token/authorize URLs, and
@@ -195,12 +219,12 @@ Per the original design: a hierarchical Orchestrator-Workers pattern where a Cla
 routes between the Vision Subagent, pricing, and draft-listing creation (all of which exist now as
 independent pieces wired together by the frontend's button-by-button flow, not by an orchestrator). Pricing
 (`browse.py`) and listing creation (`listing.py`) are both intentionally plain eBay API + Python, not
-orchestrated subagents — no LLM reasoning involved in either. The "never call `publishOffer`" boundary in
-`listing.py` **is** this project's concrete v1 Human-in-the-Loop gate for eBay writes — publishing a listing
-remains an entirely manual, human action taken in eBay's own Seller Hub, deliberately outside this
-codebase's reach. A more general orchestrator-level HITL gate (e.g. an explicit human-approval step before
-*creating* a draft, not just before publishing one) is still future work if the project's scope grows to
-need it.
+orchestrated subagents — no LLM reasoning involved in either. The in-app preview-then-publish flow described
+above **is** this project's concrete v1 Human-in-the-Loop gate for eBay writes: eBay's own Seller Hub cannot
+serve this purpose (see the Seller Hub finding at the top of this file), so the review happens in this app's
+own UI instead of a manual step in eBay's UI. A more general orchestrator-level HITL gate (e.g. an explicit
+human-approval step before *creating* a draft, not just before publishing one) is still future work if the
+project's scope grows to need it.
 
 **Known limitations, accepted rather than solved:**
 - No TTL/cleanup for abandoned uploads in `data/uploads/` (see `app.py` note above).
@@ -210,5 +234,6 @@ need it.
 - The Business Policies "opt-in" step (Seller Hub only, not API-exposed) and whether eBay's sandbox even
   supports it are both outside this codebase's control — `get_listing_policies()` degrades gracefully either
   way.
-- `listing.py`'s Seller Hub draft URL pattern (`/sh/lst/drafts`) is confident for production but unverified
-  for sandbox at time of writing.
+- The frontend's publish confirmation is a single checkbox, not e.g. a typed confirmation phrase or a
+  second server-side confirmation round-trip — considered sufficient friction for this project's scale, but
+  worth revisiting if this ever handles a real seller's actual inventory at volume.

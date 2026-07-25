@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, search_comparable_listings
 from src.ebay.config import load_ebay_config
-from src.ebay.listing import create_draft_listing, get_offer
+from src.ebay.listing import create_draft_listing, get_offer, publish_offer
 from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
@@ -224,3 +224,16 @@ def get_draft_listing_route(offer_id: str) -> dict:
     token = _call_ebay(get_valid_access_token, config)
     offer = _call_ebay(get_offer, config, token, offer_id)
     return {"status": "complete", "result": offer}
+
+
+@app.post("/api/listing/publish/{offer_id}")
+def publish_offer_route(offer_id: str) -> dict:
+    """Make a previously-created draft offer live and publicly purchasable on
+    eBay. eBay's Seller Hub has no view for API-created unpublished offers, so
+    this app's own listing-preview screen is the Human-in-the-Loop review step
+    for this action — this route is only ever called from an explicit user
+    click after that review, never automatically."""
+    config = _call_ebay(load_ebay_config)
+    token = _call_ebay(get_valid_access_token, config)
+    result = _call_ebay(publish_offer, config, token, offer_id)
+    return {"status": "complete", "result": result.model_dump()}
