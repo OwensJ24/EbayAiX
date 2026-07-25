@@ -228,6 +228,22 @@ def create_offer(
     return response.json()["offerId"]
 
 
+def get_offer(config: EbayConfig, token: str, offer_id: str) -> dict:
+    """Fetch a previously-created offer directly from eBay's API.
+
+    Useful for verifying a draft actually exists without relying on eBay's
+    sandbox Seller Hub web UI, which is known to be far less reliable than
+    production's.
+    """
+    response = httpx.get(
+        f"{config.api_base}/sell/inventory/v1/offer/{offer_id}",
+        headers=_auth_headers(token),
+        timeout=15.0,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def _seller_hub_url(config: EbayConfig) -> str:
     base = "https://www.sandbox.ebay.com" if config.environment == "sandbox" else "https://www.ebay.com"
     return f"{base}/sh/lst/drafts"

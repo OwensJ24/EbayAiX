@@ -17,7 +17,9 @@ from pydantic import BaseModel
 
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, search_comparable_listings
-from src.ebay.listing import create_draft_listing
+from src.ebay.config import load_ebay_config
+from src.ebay.listing import create_draft_listing, get_offer
+from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
 
@@ -199,3 +201,14 @@ def create_draft_listing_route(payload: DraftListingRequest, request: Request) -
     )
     path.unlink(missing_ok=True)
     return {"status": "complete", "result": result.model_dump()}
+
+
+@app.get("/api/listing/draft/{offer_id}")
+def get_draft_listing_route(offer_id: str) -> dict:
+    """Fetch a created draft straight from eBay's API — a reliable way to confirm
+    it exists without depending on eBay's sandbox Seller Hub web UI, which is known
+    to be far less complete/reliable than production's."""
+    config = _call_ebay(load_ebay_config)
+    token = _call_ebay(get_valid_access_token, config)
+    offer = _call_ebay(get_offer, config, token, offer_id)
+    return {"status": "complete", "result": offer}

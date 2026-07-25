@@ -202,13 +202,34 @@
         .then((data) => {
           const r = data.result;
           let html = `<p>Draft created — SKU <code>${r.sku}</code>, offer <code>${r.offer_id}</code>.</p>`;
-          html += `<p><a href="${r.seller_hub_url}" target="_blank" rel="noopener">Open in eBay Seller Hub</a></p>`;
+          html += `<p><a href="${r.seller_hub_url}" target="_blank" rel="noopener">Open in eBay Seller Hub</a> `;
+          html += `(sandbox's web UI is known to be unreliable — if it doesn't load, use `;
+          html += `<a href="#" id="verifyDraftLink">Verify via API</a> instead)</p>`;
           if (r.missing.length) {
             html += `<div class="warning"><strong>Still needed before you can publish:</strong><ul>`;
             html += r.notes.map((n) => `<li>${n}</li>`).join('');
             html += `</ul></div>`;
           }
+          html += `<div id="verifyResult"></div>`;
           draftStatusEl.innerHTML = html;
+
+          document.getElementById('verifyDraftLink').addEventListener('click', (e) => {
+            e.preventDefault();
+            const verifyResultEl = document.getElementById('verifyResult');
+            verifyResultEl.textContent = 'Fetching offer directly from eBay…';
+            fetch(`/api/listing/draft/${r.offer_id}`)
+              .then(async (res) => {
+                const verifyData = await res.json();
+                if (!res.ok) throw new Error(verifyData.detail || 'Request failed');
+                return verifyData;
+              })
+              .then((verifyData) => {
+                verifyResultEl.innerHTML = `<p>Confirmed — this is what eBay has on file:</p><pre>${JSON.stringify(verifyData.result, null, 2)}</pre>`;
+              })
+              .catch((err) => {
+                verifyResultEl.innerHTML = `<p class="error">${err.message}</p>`;
+              });
+          });
         })
         .catch((err) => {
           draftStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
