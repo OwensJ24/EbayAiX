@@ -200,15 +200,30 @@ development; `_call_ebay()` additionally catches the `RuntimeError` that `load_e
 eBay account — this used to reach the client as a bare 500 before `_call_ebay()` existed.
 
 **`src/ebay/listing.py`** — creates a draft eBay listing, and separately, optionally publishes it.
-`create_draft_listing()` orchestrates: `createOrReplaceInventoryItem` (PUT — title/description/condition/
-image/aspects from the `ProductIdentification`, condition mapped via `_CONDITION_MAP` to eBay's
-`ConditionEnum`, `Brand` aspect included only when `identification.brand` is set) -> best-effort enrichment
-(`suggest_category_id()` via the Taxonomy API, `get_merchant_location_key()` via the Location API,
-`get_listing_policies()` via the Account API — each independently swallows failures and returns `None`/`{}`
-rather than raising, since none of these are required to create a valid draft, only to *publish* one) ->
-`createOffer` (POST, `format: "FIXED_PRICE"`, omitting `categoryId`/`merchantLocationKey`/`listingPolicies`
-entirely when not found, never sending them as `null`). The result (`DraftListingResult`) reports which
-pieces were `included` vs. `missing`, with human-readable `notes` for each gap.
+`create_draft_listing()` orchestrates: `suggest_category_id()` via the Taxonomy API (must run *first* — see
+condition resolution below) -> `resolve_condition()` -> `createOrReplaceInventoryItem` (PUT —
+title/description/condition/image/aspects from the `ProductIdentification`, `Brand` aspect included only
+when `identification.brand` is set) -> further best-effort enrichment (`get_merchant_location_key()` via the
+Location API, `get_listing_policies()` via the Account API — each independently swallows failures and
+returns `None`/`{}` rather than raising, since none of these are required to create a valid draft, only to
+*publish* one) -> `createOffer` (POST, `format: "FIXED_PRICE"`, omitting
+`categoryId`/`merchantLocationKey`/`listingPolicies` entirely when not found, never sending them as `null`).
+The result (`DraftListingResult`) reports which pieces were `included` vs. `missing`, with human-readable
+`notes` for each gap.
+
+**Condition resolution is category-aware, not a flat static mapping — this was a real bug, not a
+hypothetical.** `_CONDITION_MAP` (our 6-tier `ProductIdentification.condition` -> a default `ConditionEnum`
+guess) is only a fallback now. eBay categories restrict which conditions are actually valid — e.g. Headphones
+only allows New/Open-box/Used/For-parts, not the full 6-tier scale — and sending a disallowed one fails with
+`errorId 25021` ("invalid for the selected primary category id"), discovered from a real production error.
+`resolve_condition()` calls the Metadata API's `get_item_condition_policies` for the resolved category and
+picks the closest allowed `ConditionEnum` via `_CONDITION_ENUM_PREFERENCE` (e.g. "Very Good"/"Good" both
+collapse to `USED_EXCELLENT` for a category with only one generic "Used" tier), falling back to the static
+guess — and adding a `notes` entry so the user knows to double-check — only when nothing in the category's
+allowed set matches any of our candidates. **Empirically confirmed finding:** `get_item_condition_policies`'s
+`filter=categoryIds:X` query param is silently ignored (returns the entire ~15k-entry marketplace catalog
+instead of filtering) unless the value is wrapped in braces — `filter=categoryIds:{X}` — which isn't
+documented anywhere obvious; found by testing directly against production rather than trusting the docs.
 
 `publish_offer(config, token, offer_id)` is a separate, single-purpose function — the only place in this
 codebase that calls eBay's `publishOffer` endpoint (`POST /sell/inventory/v1/offer/{offerId}/publish/`, no
@@ -251,9 +266,13 @@ project's scope grows to need it.
 
 **Known limitations, accepted rather than solved:**
 - No TTL/cleanup for abandoned uploads in `data/uploads/` (see `app.py` note above).
-- Category/condition validity is category-specific on eBay's side (`getItemConditionPolicies` in the
-  Metadata API could check this dynamically); `listing.py` uses a static best-effort mapping and surfaces
-  eBay's rejection cleanly via `_call_ebay()` rather than pre-validating.
+- Condition validity is now checked dynamically per category (`resolve_condition()`, see above) rather than
+  trusting a static mapping, but `_CONDITION_ID_TO_ENUM` only covers the standard 1000-7000 conditionId
+  sequence — category groups with additional non-standard IDs (fashion categories' 2990/3010 for "Pre-owned -
+  Excellent/Fair", observed live but not independently confirmed) fall through to the best-effort guess and
+  a `notes` warning rather than a confirmed match. Category *suggestion* itself (`suggest_category_id()`)
+  is still a single best-effort Taxonomy API guess with no manual override in the UI; eBay's rejection is
+  still surfaced cleanly via `_call_ebay()` when it's wrong, rather than pre-validated further.
 - The Business Policies "opt-in" step (Seller Hub only, not API-exposed) and whether eBay's sandbox even
   supports it are both outside this codebase's control — `get_listing_policies()` degrades gracefully either
   way.

@@ -39,6 +39,40 @@ _CONDITION_MAP: dict[str, str] = {
     "For Parts": "FOR_PARTS_OR_NOT_WORKING",
 }
 
+# eBay's legacy numeric conditionId (as returned by get_item_condition_policies below) ->
+# the ConditionEnum string the Inventory API's `condition` field actually expects. This
+# table is fixed/global — what varies per category is *which* subset of these IDs a given
+# category allows (e.g. Headphones only allows New/Open-box/Used/For-parts, not our full
+# 6-tier scale) — confirmed against eBay's own condition-ID reference and community
+# sources. Category groups with additional non-standard IDs (fashion categories' 2990/3010
+# for "Pre-owned - Excellent/Fair", observed live but not independently confirmed here)
+# aren't covered — those categories fall through to the best-effort guess below.
+_CONDITION_ID_TO_ENUM: dict[str, str] = {
+    "1000": "NEW",
+    "1500": "NEW_OTHER",
+    "1750": "NEW_WITH_DEFECTS",
+    "2000": "CERTIFIED_REFURBISHED",
+    "2500": "SELLER_REFURBISHED",
+    "2750": "LIKE_NEW",
+    "3000": "USED_EXCELLENT",
+    "4000": "USED_VERY_GOOD",
+    "5000": "USED_GOOD",
+    "6000": "USED_ACCEPTABLE",
+    "7000": "FOR_PARTS_OR_NOT_WORKING",
+}
+
+# For each of our own condition labels, ConditionEnum candidates in closest-first order —
+# used to pick the nearest eBay-allowed condition for a category when _CONDITION_MAP's
+# default guess isn't one of that category's allowed conditions.
+_CONDITION_ENUM_PREFERENCE: dict[str, tuple[str, ...]] = {
+    "New": ("NEW", "CERTIFIED_REFURBISHED", "NEW_OTHER"),
+    "Like New": ("LIKE_NEW", "USED_EXCELLENT", "NEW_OTHER", "SELLER_REFURBISHED"),
+    "Very Good": ("USED_VERY_GOOD", "USED_EXCELLENT", "LIKE_NEW"),
+    "Good": ("USED_GOOD", "USED_VERY_GOOD", "USED_EXCELLENT"),
+    "Acceptable": ("USED_ACCEPTABLE", "USED_GOOD", "USED_VERY_GOOD", "USED_EXCELLENT"),
+    "For Parts": ("FOR_PARTS_OR_NOT_WORKING", "USED_ACCEPTABLE"),
+}
+
 
 def _auth_headers(token: str) -> dict[str, str]:
     # Content-Language is required on every Sell Inventory API call that writes data
@@ -68,9 +102,11 @@ def _build_description(identification: ProductIdentification) -> str:
     return description[:4000]
 
 
-def _build_inventory_item_payload(identification: ProductIdentification, image_url: str, quantity: int) -> dict:
+def _build_inventory_item_payload(
+    identification: ProductIdentification, image_url: str, quantity: int, condition_enum: str
+) -> dict:
     payload = {
-        "condition": _CONDITION_MAP[identification.condition],
+        "condition": condition_enum,
         "product": {
             "title": identification.item_name[:80],
             "description": _build_description(identification),
@@ -84,9 +120,15 @@ def _build_inventory_item_payload(identification: ProductIdentification, image_u
 
 
 def create_or_replace_inventory_item(
-    config: EbayConfig, token: str, sku: str, identification: ProductIdentification, image_url: str, quantity: int = 1
+    config: EbayConfig,
+    token: str,
+    sku: str,
+    identification: ProductIdentification,
+    image_url: str,
+    condition_enum: str,
+    quantity: int = 1,
 ) -> None:
-    payload = _build_inventory_item_payload(identification, image_url, quantity)
+    payload = _build_inventory_item_payload(identification, image_url, quantity, condition_enum)
     headers = _auth_headers(token)
 
     logger.info(
@@ -130,6 +172,58 @@ def suggest_category_id(config: EbayConfig, token: str, query: str) -> str | Non
     except (httpx.HTTPError, KeyError, IndexError) as e:
         logger.info("suggest_category_id degraded: %r", e)
         return None
+
+
+def resolve_condition(
+    config: EbayConfig, token: str, category_id: str | None, condition: str
+) -> tuple[str, bool]:
+    """Picks a ConditionEnum for `condition` that eBay's Metadata API confirms is valid
+    for `category_id`. Returns (enum, confirmed) — falls back to the static
+    _CONDITION_MAP guess with confirmed=False when there's no category, the lookup
+    fails, or none of our own candidates are in that category's allowed set (e.g.
+    fashion categories using non-standard conditionIds we don't have a mapping for).
+    This exists because eBay categories restrict which conditions are valid — e.g.
+    Headphones only allows New/Open-box/Used/For-parts, not our full 6-tier scale —
+    and sending a disallowed one fails with errorId 25021 ("invalid for the selected
+    primary category id").
+    """
+    default = _CONDITION_MAP[condition]
+    if not category_id:
+        return default, False
+
+    try:
+        response = httpx.get(
+            f"{config.api_base}/sell/metadata/v1/marketplace/{_MARKETPLACE_ID}/get_item_condition_policies",
+            headers=_auth_headers(token),
+            # eBay's filter expression requires braces around the value — confirmed
+            # empirically: `categoryIds:123` is silently ignored (returns the entire
+            # ~15k-entry marketplace catalog instead of filtering); only
+            # `categoryIds:{123}` actually filters to the requested category.
+            params={"filter": f"categoryIds:{{{category_id}}}"},
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        policies = response.json().get("itemConditionPolicies", [])
+        if not policies:
+            logger.info("resolve_condition degraded: no condition policy for category=%s", category_id)
+            return default, False
+
+        allowed_ids = {c["conditionId"] for c in policies[0].get("itemConditions", [])}
+        allowed_enums = {_CONDITION_ID_TO_ENUM[cid] for cid in allowed_ids if cid in _CONDITION_ID_TO_ENUM}
+        for candidate in _CONDITION_ENUM_PREFERENCE[condition]:
+            if candidate in allowed_enums:
+                return candidate, True
+
+        logger.info(
+            "resolve_condition degraded: none of %s allowed for category=%s (allowed ids=%s)",
+            _CONDITION_ENUM_PREFERENCE[condition],
+            category_id,
+            allowed_ids,
+        )
+        return default, False
+    except (httpx.HTTPError, KeyError, IndexError) as e:
+        logger.info("resolve_condition degraded: %r", e)
+        return default, False
 
 
 def get_merchant_location_key(config: EbayConfig, token: str) -> str | None:
@@ -322,11 +416,14 @@ def create_draft_listing(
     token = get_valid_access_token(config)
     sku = generate_sku(upload_id)
 
-    create_or_replace_inventory_item(config, token, sku, identification, image_url, quantity)
-    included = ["inventory_item"]
+    included: list[str] = []
     missing: list[str] = []
     notes: list[str] = []
 
+    # Category must be known before the inventory item is created, since the item's
+    # condition has to already be one this category allows (see resolve_condition) —
+    # eBay validates condition-vs-category downstream and rejects the mismatch with a
+    # cryptic errorId 25021, so this order minimizes the chance of that round-trip.
     query = build_query(identification)
     category_id = suggest_category_id(config, token, query)
     if category_id:
@@ -334,6 +431,16 @@ def create_draft_listing(
     else:
         missing.append("category")
         notes.append("No eBay category suggestion found — set one manually before publishing.")
+
+    condition_enum, condition_confirmed = resolve_condition(config, token, category_id, identification.condition)
+    if category_id and not condition_confirmed:
+        notes.append(
+            f"Couldn't confirm '{identification.condition}' is a valid eBay condition for the detected "
+            f"category — used a best-effort guess ({condition_enum}); double-check it before publishing."
+        )
+
+    create_or_replace_inventory_item(config, token, sku, identification, image_url, condition_enum, quantity)
+    included.append("inventory_item")
 
     merchant_location_key = get_merchant_location_key(config, token)
     if merchant_location_key:
