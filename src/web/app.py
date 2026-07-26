@@ -224,6 +224,7 @@ class DraftListingRequest(BaseModel):
     identification: ProductIdentification
     upload_id: str
     price: float
+    weight_lbs: float
     currency: str = "USD"
 
 
@@ -241,7 +242,13 @@ def create_draft_listing_route(payload: DraftListingRequest, request: Request) -
 
     image_url = f"{_public_base_url(request)}/uploads/{path.name}"
     result = _call_ebay(
-        create_draft_listing, payload.identification, payload.upload_id, image_url, payload.price, payload.currency
+        create_draft_listing,
+        payload.identification,
+        payload.upload_id,
+        image_url,
+        payload.price,
+        payload.weight_lbs,
+        payload.currency,
     )
     path.unlink(missing_ok=True)
     return {"status": "complete", "result": result.model_dump()}

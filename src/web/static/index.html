@@ -71,6 +71,8 @@
   <div id="draftSection" style="display:none;">
     <label for="priceInput">Listing price (USD)</label>
     <input type="number" id="priceInput" min="0.01" step="0.01">
+    <label for="weightInput">Package weight (lbs, including packaging)</label>
+    <input type="number" id="weightInput" min="0.1" step="0.1" placeholder="e.g. 1.5">
     <button id="draftButton">Create Draft Listing</button>
     <div id="draftStatus"></div>
   </div>
@@ -107,6 +109,7 @@
     const priceStatusEl = document.getElementById('priceStatus');
     const draftSection = document.getElementById('draftSection');
     const priceInput = document.getElementById('priceInput');
+    const weightInput = document.getElementById('weightInput');
     const draftButton = document.getElementById('draftButton');
     const draftStatusEl = document.getElementById('draftStatus');
     const previewSection = document.getElementById('previewSection');
@@ -306,6 +309,11 @@
         draftStatusEl.innerHTML = '<p class="error">Enter a price greater than 0.</p>';
         return;
       }
+      const weightLbs = parseFloat(weightInput.value);
+      if (!(weightLbs > 0)) {
+        draftStatusEl.innerHTML = '<p class="error">Enter a package weight greater than 0 — eBay requires this to calculate shipping.</p>';
+        return;
+      }
 
       draftButton.disabled = true;
       draftStatusEl.textContent = 'Creating draft listing on eBay…';
@@ -313,7 +321,7 @@
       fetch('/api/listing/draft', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identification: currentIdentification, upload_id: currentUploadId, price }),
+        body: JSON.stringify({ identification: currentIdentification, upload_id: currentUploadId, price, weight_lbs: weightLbs }),
       })
         .then(async (res) => {
           const data = await res.json();
@@ -323,7 +331,7 @@
         .then((data) => {
           currentDraftResult = data.result;
           draftStatusEl.innerHTML = `<p>Draft created — SKU <code>${escapeHtml(currentDraftResult.sku)}</code>, offer <code>${escapeHtml(currentDraftResult.offer_id)}</code>.</p>`;
-          renderListingPreview(currentDraftResult, price);
+          renderListingPreview(currentDraftResult, price, weightLbs);
           previewSection.style.display = 'block';
         })
         .catch((err) => {
@@ -334,7 +342,7 @@
         });
     });
 
-    function renderListingPreview(draftResult, price) {
+    function renderListingPreview(draftResult, price, weightLbs) {
       const id = currentIdentification;
       const descriptionLines = [id.condition_notes];
       if (id.distinguishing_features && id.distinguishing_features.length) {
@@ -348,6 +356,7 @@
       if (id.brand) html += `<p><strong>Brand:</strong> ${escapeHtml(id.brand)}</p>`;
       html += `<p><strong>Condition:</strong> ${escapeHtml(id.condition)}</p>`;
       html += `<p><strong>Price:</strong> $${price.toFixed(2)} USD</p>`;
+      html += `<p><strong>Package weight:</strong> ${weightLbs.toFixed(1)} lbs</p>`;
       html += `<p><strong>Description:</strong></p><pre>${escapeHtml(descriptionLines.join('\n'))}</pre>`;
       const aspectEntries = Object.entries(draftResult.aspects || {});
       if (aspectEntries.length) {

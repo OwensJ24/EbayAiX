@@ -109,6 +109,7 @@ def _build_inventory_item_payload(
     quantity: int,
     condition_enum: str,
     aspects: dict[str, list[str]],
+    weight_lbs: float,
 ) -> dict:
     payload = {
         "condition": condition_enum,
@@ -117,6 +118,7 @@ def _build_inventory_item_payload(
             "description": _build_description(identification),
             "imageUrls": [image_url],
         },
+        "packageWeightAndSize": {"weight": {"value": weight_lbs, "unit": "POUND"}},
         "availability": {"shipToLocationAvailability": {"quantity": quantity}},
     }
     if aspects:
@@ -132,9 +134,10 @@ def create_or_replace_inventory_item(
     image_url: str,
     condition_enum: str,
     aspects: dict[str, list[str]],
+    weight_lbs: float,
     quantity: int = 1,
 ) -> None:
-    payload = _build_inventory_item_payload(identification, image_url, quantity, condition_enum, aspects)
+    payload = _build_inventory_item_payload(identification, image_url, quantity, condition_enum, aspects, weight_lbs)
     headers = _auth_headers(token)
 
     logger.info(
@@ -515,6 +518,7 @@ def create_draft_listing(
     upload_id: str,
     image_url: str,
     price: float,
+    weight_lbs: float,
     currency: str = "USD",
     quantity: int = 1,
 ) -> DraftListingResult:
@@ -567,7 +571,9 @@ def create_draft_listing(
         # since we have it and it's almost always accepted regardless of category.
         aspects = {"Brand": [identification.brand]}
 
-    create_or_replace_inventory_item(config, token, sku, identification, image_url, condition_enum, aspects, quantity)
+    create_or_replace_inventory_item(
+        config, token, sku, identification, image_url, condition_enum, aspects, weight_lbs, quantity
+    )
     included.append("inventory_item")
 
     merchant_location_key = get_merchant_location_key(config, token)

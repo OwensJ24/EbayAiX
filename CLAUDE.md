@@ -155,8 +155,12 @@ Once identification is final, the frontend shows a "Show Comparable Listings" bu
 `ProductIdentification` (FastAPI validates the JSON body directly against that Pydantic model) to
 `POST /api/price`, which calls `search_comparable_listings()` above using a query built by
 `browse.build_query()` (shared with the Taxonomy category lookup in `listing.py`, see below). The average of
-the returned comps pre-fills an editable price field, and a "Create Draft Listing" button posts
-`{identification, upload_id, price, currency}` to `POST /api/listing/draft`, which calls
+the returned comps pre-fills an editable price field. The user must also enter a package weight (lbs) — a
+real, blocking eBay requirement (`packageWeightAndSize.weight`, `errorId 25020` "package weight is not valid
+or is missing" if omitted, discovered from a real production error — the Vision Subagent has no way to
+estimate this from a photo, so it's the one piece of listing data the human always has to supply directly
+rather than something the pipeline can infer). A "Create Draft Listing" button posts
+`{identification, upload_id, price, weight_lbs, currency}` to `POST /api/listing/draft`, which calls
 `create_draft_listing()` (see `src/ebay/listing.py` below) using the still-on-disk image, served publicly at
 `GET /uploads/{filename}` (a `StaticFiles` mount — upload IDs are `uuid4().hex`, unguessable enough that
 serving them without auth is an accepted tradeoff for this portfolio project's scale).
