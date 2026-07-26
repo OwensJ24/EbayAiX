@@ -151,6 +151,20 @@ cut per-inference thread/memory overhead further. The frontend adds a client-sid
 dropzone/refine button while a request is in flight) so this is defense-in-depth, not the only line of
 defense — a different client hitting the API directly still can't cause concurrent local inference.
 
+**A second, distinct OOM pattern: crashes reliably on the *second* full identify pass, even with zero
+concurrency** (e.g. completing one flow, refreshing the page, then starting another one). This is a known
+glibc/PyTorch behavior on constrained containers, not a code bug in the traditional sense — glibc's malloc
+creates multiple memory arenas per process, and memory freed within a non-primary arena often isn't returned
+to the OS, so RSS ratchets upward across requests instead of resetting after each one, until it exceeds
+Render's free-tier 512MB limit. Two mitigations: `Dockerfile` sets `ENV MALLOC_ARENA_MAX=1` (caps glibc to a
+single arena it can actually release memory from — verified via `docker run` that the env var reaches the
+container); `app.py`'s `identify()`/`refine()` call `gc.collect()` immediately after `_preprocessor.classify()`
+(still inside `_inference_lock`, so it can't race a concurrent classify() call), forcing CPython to release
+the heaviest per-request allocation (the image tensor + inference pass) promptly rather than waiting on
+normal refcounting/GC timing. If OOM crashes persist after this, the free tier's 512MB may simply be
+insufficient for this stack (PyTorch + ResNet50 + FastAPI + Anthropic/httpx clients) — upgrading Render's
+plan would be the next lever, not further code changes.
+
 Once identification is final, the frontend shows a "Show Comparable Listings" button that posts the
 `ProductIdentification` (FastAPI validates the JSON body directly against that Pydantic model) to
 `POST /api/price`, which calls `search_comparable_listings()` above using a query built by

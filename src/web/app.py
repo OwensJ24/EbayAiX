@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import threading
@@ -118,6 +119,13 @@ def identify(file: UploadFile = File(...)) -> dict:
     try:
         with _inference_lock:
             local_result = _preprocessor.classify(path)
+            # PyTorch's CPU allocator doesn't reliably return freed memory to the OS
+            # between requests, so RSS tends to ratchet upward run over run rather than
+            # reset — on Render's free-tier 512MB limit this reliably OOMs by the second
+            # full identify pass. Forcing collection right after the heaviest allocation
+            # (image tensor + inference) while still holding the lock (so it can't race
+            # a concurrent classify()) measurably reduces that carryover.
+            gc.collect()
         identification = _call_claude(_vision_subagent.identify, path, local_result)
     except Exception:
         path.unlink(missing_ok=True)
@@ -146,6 +154,7 @@ def refine(payload: RefineRequest) -> dict:
     try:
         with _inference_lock:
             local_result = _preprocessor.classify(path)
+            gc.collect()
         identification = _call_claude(
             _vision_subagent.identify, path, local_result, user_provided_name=payload.item_name
         )
