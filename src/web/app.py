@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, search_comparable_listings
 from src.ebay.config import load_ebay_config
-from src.ebay.listing import create_draft_listing, get_offer, publish_offer
+from src.ebay.listing import create_draft_listing, create_inventory_location, get_offer, publish_offer
 from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
@@ -176,6 +176,38 @@ def _call_ebay(fn: Callable[..., T], *args, **kwargs) -> T:
         raise HTTPException(status_code=502, detail=detail)
     except httpx.HTTPError:
         raise HTTPException(status_code=503, detail="Could not reach eBay's API. Please try again.")
+
+
+class InventoryLocationRequest(BaseModel):
+    city: str
+    state: str
+    postal_code: str
+    country: str = "US"
+    name: str = "Main Location"
+    address_line1: str | None = None
+    location_instructions: str | None = None
+
+
+@app.post("/api/ebay/location")
+def create_inventory_location_route(payload: InventoryLocationRequest) -> dict:
+    """One-time account setup: registers a single merchant inventory location, which
+    eBay's Inventory API requires on every offer before it can be published (separate
+    from — and not automatically populated by — any 'ship-from' address configured
+    elsewhere in Seller Hub)."""
+    config = _call_ebay(load_ebay_config)
+    token = _call_ebay(get_valid_access_token, config)
+    address = {
+        "city": payload.city,
+        "stateOrProvince": payload.state,
+        "postalCode": payload.postal_code,
+        "country": payload.country,
+    }
+    if payload.address_line1:
+        address["addressLine1"] = payload.address_line1
+    _call_ebay(
+        create_inventory_location, config, token, address, payload.name, payload.location_instructions
+    )
+    return {"status": "complete"}
 
 
 @app.post("/api/price")

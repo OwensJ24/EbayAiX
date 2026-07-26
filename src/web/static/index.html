@@ -31,6 +31,27 @@
 <body>
   <h1>AgentX — Item Identifier</h1>
   <div id="ebayStatus">Checking eBay connection…</div>
+
+  <details id="locationSetup" style="margin-bottom:1.5rem;">
+    <summary style="cursor:pointer; font-size:0.9rem;">Set up eBay shipping location (one-time, required before publishing)</summary>
+    <div style="margin-top:0.75rem;">
+      <label for="locName">Location name</label>
+      <input type="text" id="locName" value="Main Location">
+      <label for="locAddressLine1">Address line 1 (optional)</label>
+      <input type="text" id="locAddressLine1" placeholder="123 Main St">
+      <label for="locCity">City</label>
+      <input type="text" id="locCity" placeholder="Columbus">
+      <label for="locState">State</label>
+      <input type="text" id="locState" placeholder="OH">
+      <label for="locPostalCode">Postal code</label>
+      <input type="text" id="locPostalCode" placeholder="43215">
+      <label for="locCountry">Country</label>
+      <input type="text" id="locCountry" value="US">
+      <button id="locationButton">Create Shipping Location</button>
+      <div id="locationStatus"></div>
+    </div>
+  </details>
+
   <p>Upload a photo of the item (JPEG/PNG/WEBP, up to 10MB).</p>
 
   <div id="dropzone">
@@ -121,6 +142,49 @@
         }
       })
       .catch(() => { ebayStatusEl.textContent = 'eBay: status unavailable'; });
+
+    const locationButton = document.getElementById('locationButton');
+    const locationStatusEl = document.getElementById('locationStatus');
+    locationButton.addEventListener('click', () => {
+      const city = document.getElementById('locCity').value.trim();
+      const state = document.getElementById('locState').value.trim();
+      const postalCode = document.getElementById('locPostalCode').value.trim();
+      const country = document.getElementById('locCountry').value.trim() || 'US';
+      if (!city || !state || !postalCode) {
+        locationStatusEl.innerHTML = '<p class="error">City, state, and postal code are required.</p>';
+        return;
+      }
+
+      locationButton.disabled = true;
+      locationStatusEl.textContent = 'Creating shipping location on eBay…';
+
+      fetch('/api/ebay/location', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: document.getElementById('locName').value.trim() || 'Main Location',
+          address_line1: document.getElementById('locAddressLine1').value.trim() || null,
+          city,
+          state,
+          postal_code: postalCode,
+          country,
+        }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then(() => {
+          locationStatusEl.innerHTML = '<p>Shipping location created — future drafts will pick it up automatically.</p>';
+        })
+        .catch((err) => {
+          locationStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          locationButton.disabled = false;
+        });
+    });
 
     dropzone.addEventListener('click', () => { if (!isUploading) fileInput.click(); });
     dropzone.addEventListener('dragover', (e) => { e.preventDefault(); if (!isUploading) dropzone.classList.add('drag'); });

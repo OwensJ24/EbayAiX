@@ -176,9 +176,19 @@ letting the user attempt to publish anyway just wastes a round-trip to eBay for 
 was discovered from a real production error: `publishOffer` returned `errorId 25002` with the message
 `"No <Item.Country> exists..."`, which sounds like a missing address field but actually means **no inventory
 location (merchantLocationKey) is set up on the eBay account** — confirmed via eBay developer community
-threads, the same kind of misleadingly-worded eBay error as the earlier `Content-Language`/25709 case. Fixing
-it requires the user to set up a shipping/inventory location in eBay's own Seller Hub — outside this
-codebase's control, same as the Business Policies opt-in below.
+threads, the same kind of misleadingly-worded eBay error as the earlier `Content-Language`/25709 case. An
+eBay account's general "ship-from" address (set elsewhere in Seller Hub) is a distinct concept from an
+Inventory API location and doesn't populate this automatically.
+
+**`POST /api/ebay/location`** (frontend: a collapsed "Set up eBay shipping location" `<details>` block above
+the upload dropzone) closes this gap directly rather than sending the user to Seller Hub: it calls
+`create_inventory_location()` (`src/ebay/listing.py`) — `POST
+/sell/inventory/v1/location/{merchantLocationKey}` with the address the user types in (city/state/postal
+code/country required, address line 1 optional) — registering one fixed location,
+`DEFAULT_MERCHANT_LOCATION_KEY = "agentx-default-location"`. One fixed key (not per-listing, not
+user-chosen) is deliberate: this is a single-seller portfolio app, so one location is all it ever needs.
+This is meant to be run once per eBay account; `get_merchant_location_key()` then finds it automatically on
+every subsequent draft via the existing `GET /sell/inventory/v1/location` lookup.
 
 The `VisionPreprocessor`/`VisionSubagent` instances are constructed once at module import time and reused
 across requests — re-instantiating per request would reload the ResNet50 weights every call. `_call_claude()`

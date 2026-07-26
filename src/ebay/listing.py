@@ -159,6 +159,51 @@ def get_merchant_location_key(config: EbayConfig, token: str) -> str | None:
         return None
 
 
+# One-time setup: a single merchant location, shared by every draft this app creates.
+# This is a single-seller portfolio app, so one fixed key (rather than a per-listing or
+# user-chosen one) is deliberate — create_inventory_location() is only ever meant to be
+# called once per eBay account, from the frontend's "Set up shipping location" form.
+DEFAULT_MERCHANT_LOCATION_KEY = "agentx-default-location"
+
+
+def create_inventory_location(
+    config: EbayConfig,
+    token: str,
+    address: dict[str, str],
+    name: str = "Main Location",
+    location_instructions: str | None = None,
+    merchant_location_key: str = DEFAULT_MERCHANT_LOCATION_KEY,
+) -> None:
+    payload: dict = {
+        "location": {"address": address},
+        "name": name,
+        "merchantLocationStatus": "ENABLED",
+        "locationTypes": ["WAREHOUSE"],
+    }
+    if location_instructions:
+        payload["locationInstructions"] = location_instructions
+
+    headers = _auth_headers(token)
+    logger.info(
+        "createInventoryLocation request: url=%s payload=%s",
+        f"{config.api_base}/sell/inventory/v1/location/{merchant_location_key}",
+        payload,
+    )
+    response = httpx.post(
+        f"{config.api_base}/sell/inventory/v1/location/{merchant_location_key}",
+        headers=headers,
+        json=payload,
+        timeout=20.0,
+    )
+    logger.info(
+        "createInventoryLocation response: status=%d headers=%s body=%s",
+        response.status_code,
+        dict(response.headers),
+        response.text,
+    )
+    response.raise_for_status()
+
+
 _POLICY_ENDPOINTS = {
     "fulfillmentPolicyId": ("fulfillment_policy", "fulfillmentPolicies", "fulfillmentPolicyId"),
     "paymentPolicyId": ("payment_policy", "paymentPolicies", "paymentPolicyId"),
