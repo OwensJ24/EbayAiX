@@ -200,16 +200,39 @@ development; `_call_ebay()` additionally catches the `RuntimeError` that `load_e
 eBay account — this used to reach the client as a bare 500 before `_call_ebay()` existed.
 
 **`src/ebay/listing.py`** — creates a draft eBay listing, and separately, optionally publishes it.
-`create_draft_listing()` orchestrates: `suggest_category_id()` via the Taxonomy API (must run *first* — see
-condition resolution below) -> `resolve_condition()` -> `createOrReplaceInventoryItem` (PUT —
-title/description/condition/image/aspects from the `ProductIdentification`, `Brand` aspect included only
-when `identification.brand` is set) -> further best-effort enrichment (`get_merchant_location_key()` via the
+`create_draft_listing()` orchestrates: `suggest_category_id()` via the Taxonomy API (must run *first* — both
+condition and required-aspect resolution below depend on knowing the category) -> `resolve_condition()` ->
+`resolve_aspects()` -> `createOrReplaceInventoryItem` (PUT — title/description/condition/image/aspects from
+the `ProductIdentification`) -> further best-effort enrichment (`get_merchant_location_key()` via the
 Location API, `get_listing_policies()` via the Account API — each independently swallows failures and
 returns `None`/`{}` rather than raising, since none of these are required to create a valid draft, only to
 *publish* one) -> `createOffer` (POST, `format: "FIXED_PRICE"`, omitting
 `categoryId`/`merchantLocationKey`/`listingPolicies` entirely when not found, never sending them as `null`).
 The result (`DraftListingResult`) reports which pieces were `included` vs. `missing`, with human-readable
 `notes` for each gap.
+
+**Required item specifics ("aspects") are resolved per category, not just Brand.** Many eBay categories
+reject listing creation outright if required aspects are missing — e.g. Headphones requires
+Brand/Model/Type/Connectivity/Color, not just Brand — surfacing as `errorId 25002` ("item specific X is
+missing"), discovered from a real production error (the same error family as the merchant-location
+"Item.Country" case). `get_required_aspects()` fetches these via the Taxonomy API's
+`get_item_aspects_for_category`; `resolve_aspects()` fills them from `identification` data already
+available, in order: (1) direct field match for Brand/Model, (2) a **word-boundary** match (not naive
+substring — a naive check for shoe size `"9"` false-positived inside `"Air Max 90"` during testing, since
+fixed with a regex `\b` boundary) of one of eBay's suggested values against the identification's own text,
+(3) one of eBay's own "unknown" catch-all values when the aspect offers one (e.g. `"Unbranded"`, `"Not
+Applicable"` — these appear in eBay's own suggested-values lists, so using them is never a fabrication), (4)
+for `FREE_TEXT`-mode aspects only (eBay's suggested values are autocomplete, not a strict enum, so any string
+is accepted) an honest `"Not Specified"` placeholder, surfaced in the frontend preview as a flagged
+auto-fill. Only a genuinely unresolvable non-free-text aspect (no data match, no catch-all value — e.g.
+"Department" for a shoe category, since guessing a gender department would be a real fabrication) raises a
+`RuntimeError` and stops `create_draft_listing()` **before** calling eBay at all — unlike
+merchant_location/listing_policies (deferred to publish-time and fixable via account setup), item specifics
+are validated by eBay when the offer/inventory item is created, so letting it through would just fail
+moments later with the same cryptic error this exists to avoid; failing fast with our own clear message
+saves the round-trip. This also can't be worked around via Seller Hub the way location/policies gaps can —
+Seller Hub has no view into an unpublished offer at all (see the Seller Hub finding above), so pointing the
+user there for an item-specifics gap would be actively wrong.
 
 **Condition resolution is category-aware, not a flat static mapping — this was a real bug, not a
 hypothetical.** `_CONDITION_MAP` (our 6-tier `ProductIdentification.condition` -> a default `ConditionEnum`

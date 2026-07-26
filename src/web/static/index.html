@@ -349,6 +349,15 @@
       html += `<p><strong>Condition:</strong> ${escapeHtml(id.condition)}</p>`;
       html += `<p><strong>Price:</strong> $${price.toFixed(2)} USD</p>`;
       html += `<p><strong>Description:</strong></p><pre>${escapeHtml(descriptionLines.join('\n'))}</pre>`;
+      const aspectEntries = Object.entries(draftResult.aspects || {});
+      if (aspectEntries.length) {
+        html += '<p><strong>Item specifics eBay requires:</strong></p><ul>';
+        html += aspectEntries.map(([name, values]) => `<li>${escapeHtml(name)}: ${escapeHtml(values.join(', '))}</li>`).join('');
+        html += '</ul>';
+        if (aspectEntries.some(([, values]) => values.includes('Not Specified'))) {
+          html += '<p style="font-size:0.85rem; color:#8a6d00;">Some of these were auto-filled with a generic placeholder since they couldn\'t be determined from the photo — worth correcting via eBay after publishing if inaccurate.</p>';
+        }
+      }
       html += '</div>';
       listingPreviewEl.innerHTML = html;
 

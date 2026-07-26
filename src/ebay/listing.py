@@ -16,6 +16,7 @@ and publicly purchasable — not a reversible/staging action.
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 from pydantic import BaseModel
@@ -103,7 +104,11 @@ def _build_description(identification: ProductIdentification) -> str:
 
 
 def _build_inventory_item_payload(
-    identification: ProductIdentification, image_url: str, quantity: int, condition_enum: str
+    identification: ProductIdentification,
+    image_url: str,
+    quantity: int,
+    condition_enum: str,
+    aspects: dict[str, list[str]],
 ) -> dict:
     payload = {
         "condition": condition_enum,
@@ -114,8 +119,8 @@ def _build_inventory_item_payload(
         },
         "availability": {"shipToLocationAvailability": {"quantity": quantity}},
     }
-    if identification.brand:
-        payload["product"]["aspects"] = {"Brand": [identification.brand]}
+    if aspects:
+        payload["product"]["aspects"] = aspects
     return payload
 
 
@@ -126,9 +131,10 @@ def create_or_replace_inventory_item(
     identification: ProductIdentification,
     image_url: str,
     condition_enum: str,
+    aspects: dict[str, list[str]],
     quantity: int = 1,
 ) -> None:
-    payload = _build_inventory_item_payload(identification, image_url, quantity, condition_enum)
+    payload = _build_inventory_item_payload(identification, image_url, quantity, condition_enum, aspects)
     headers = _auth_headers(token)
 
     logger.info(
@@ -224,6 +230,105 @@ def resolve_condition(
     except (httpx.HTTPError, KeyError, IndexError) as e:
         logger.info("resolve_condition degraded: %r", e)
         return default, False
+
+
+def get_required_aspects(config: EbayConfig, token: str, category_id: str) -> list[dict]:
+    """Fetches eBay's required item specifics ('aspects') for a category via the
+    Taxonomy API. Many categories reject listing creation entirely if these aren't
+    present (e.g. Headphones requires Brand/Model/Type/Connectivity/Color) — this is
+    what errorId 25002 "item specific X is missing" means. Each returned dict has
+    `name`, `values` (eBay's suggested values — an autocomplete list, not a strict
+    enum, when `mode` is "FREE_TEXT") and `mode`.
+    """
+    try:
+        response = httpx.get(
+            f"{config.api_base}/commerce/taxonomy/v1/category_tree/{_CATEGORY_TREE_ID}/get_item_aspects_for_category",
+            headers=_auth_headers(token),
+            params={"category_id": category_id},
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        required = []
+        for aspect in response.json().get("aspects", []):
+            constraint = aspect.get("aspectConstraint", {})
+            if not constraint.get("aspectRequired"):
+                continue
+            required.append(
+                {
+                    "name": aspect["localizedAspectName"],
+                    "values": [
+                        v["localizedValue"] for v in aspect.get("aspectValues", []) if v.get("localizedValue")
+                    ],
+                    "mode": constraint.get("aspectMode"),
+                }
+            )
+        return required
+    except (httpx.HTTPError, KeyError) as e:
+        logger.info("get_required_aspects degraded: %r", e)
+        return []
+
+
+# eBay's own suggested-values lists for otherwise-unknown required aspects commonly
+# include a designated catch-all (e.g. "Unbranded", "Not Applicable") — preferring one
+# of these over inventing a value keeps every aspect we send eBay-sanctioned and honest.
+_UNKNOWN_ASPECT_MARKERS = ("not applicable", "does not apply", "unbranded", "unknown", "n/a", "no brand")
+
+
+def _find_fallback_aspect_value(values: list[str]) -> str | None:
+    return next((v for v in values if v.strip().lower() in _UNKNOWN_ASPECT_MARKERS), None)
+
+
+def resolve_aspects(
+    identification: ProductIdentification, required_aspects: list[dict]
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Best-effort fills eBay's required aspects from data already in `identification`
+    — never fabricates a plausible-sounding but made-up value (e.g. never guesses a
+    color). Resolution order per aspect: (1) direct field match for Brand/Model, (2) a
+    substring match of one of eBay's suggested values against the identification's own
+    text, (3) one of eBay's own "unknown" catch-all values if it offers one, (4) for
+    FREE_TEXT aspects only (no real enum to violate) an honest 'Not Specified'
+    placeholder. Only truly unresolvable non-free-text aspects end up in the returned
+    unresolved list.
+    """
+    corpus = " ".join(
+        [identification.item_name, identification.condition_notes, *identification.distinguishing_features]
+    ).lower()
+
+    aspects: dict[str, list[str]] = {}
+    unresolved: list[str] = []
+
+    for aspect in required_aspects:
+        name = aspect["name"]
+        values = aspect["values"]
+
+        if name == "Brand" and identification.brand:
+            aspects[name] = [identification.brand]
+            continue
+        if name in ("Model", "MPN", "Manufacturer Part Number") and identification.model_number:
+            aspects[name] = [identification.model_number]
+            continue
+
+        # Word-boundary match, not plain substring containment — e.g. a naive `in`
+        # check for shoe size "9" would false-positive inside "Air Max 90".
+        match = next(
+            (v for v in values if re.search(rf"\b{re.escape(v.lower())}\b", corpus)), None
+        )
+        if match:
+            aspects[name] = [match]
+            continue
+
+        fallback = _find_fallback_aspect_value(values)
+        if fallback:
+            aspects[name] = [fallback]
+            continue
+
+        if aspect["mode"] == "FREE_TEXT":
+            aspects[name] = ["Not Specified"]
+            continue
+
+        unresolved.append(name)
+
+    return aspects, unresolved
 
 
 def get_merchant_location_key(config: EbayConfig, token: str) -> str | None:
@@ -402,6 +507,7 @@ class DraftListingResult(BaseModel):
     included: list[str]
     missing: list[str]
     notes: list[str]
+    aspects: dict[str, list[str]] = {}
 
 
 def create_draft_listing(
@@ -439,7 +545,29 @@ def create_draft_listing(
             f"category — used a best-effort guess ({condition_enum}); double-check it before publishing."
         )
 
-    create_or_replace_inventory_item(config, token, sku, identification, image_url, condition_enum, quantity)
+    aspects: dict[str, list[str]] = {}
+    if category_id:
+        required_aspects = get_required_aspects(config, token, category_id)
+        aspects, unresolved_aspects = resolve_aspects(identification, required_aspects)
+        if unresolved_aspects:
+            # Unlike merchant_location/listing_policies (only required to *publish*),
+            # eBay validates item specifics when the offer/inventory item is created —
+            # letting this through would just fail moments later with the same cryptic
+            # errorId 25002 this whole function exists to avoid. Fail fast with a clear
+            # message instead of spending an eBay round-trip on a guaranteed rejection.
+            # Note: this can't be fixed in Seller Hub either — Seller Hub has no view
+            # into an unpublished offer at all (see module docstring).
+            raise RuntimeError(
+                "eBay requires a value for these item specifics in the detected category, and it "
+                f"couldn't be determined automatically from the photo: {', '.join(unresolved_aspects)}. "
+                "Try again with a clearer photo or a more descriptive item name."
+            )
+    elif identification.brand:
+        # No category means no aspect requirements are known at all — still send Brand
+        # since we have it and it's almost always accepted regardless of category.
+        aspects = {"Brand": [identification.brand]}
+
+    create_or_replace_inventory_item(config, token, sku, identification, image_url, condition_enum, aspects, quantity)
     included.append("inventory_item")
 
     merchant_location_key = get_merchant_location_key(config, token)
@@ -471,6 +599,7 @@ def create_draft_listing(
         included=included,
         missing=missing,
         notes=notes,
+        aspects=aspects,
     )
 
 
