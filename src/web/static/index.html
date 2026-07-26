@@ -151,6 +151,7 @@
       publishStatusEl.innerHTML = '';
       verifyResultEl.innerHTML = '';
       confirmPublishCheckbox.checked = false;
+      confirmPublishCheckbox.disabled = false;
       publishButton.disabled = true;
       currentUploadId = null;
       currentIdentification = null;
@@ -287,13 +288,22 @@
       html += '</div>';
       listingPreviewEl.innerHTML = html;
 
-      if (draftResult.missing.length) {
-        draftWarningsEl.innerHTML = `<strong>Still incomplete:</strong><ul>${draftResult.notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
+      // category/merchant_location/listing_policies are each required by eBay to
+      // *publish* an offer (unlike creating the draft/offer itself, which succeeds
+      // without them) — if any are missing, publishing is guaranteed to fail with a
+      // confusing eBay error (e.g. a mislabeled "Item.Country" error that actually
+      // means "no inventory location on this account"), so block it here instead.
+      const canPublish = draftResult.missing.length === 0;
+      if (!canPublish) {
+        draftWarningsEl.innerHTML = `<strong>Can't publish yet — finish these in eBay Seller Hub first, then come back:</strong><ul>${draftResult.notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
         draftWarningsEl.style.display = 'block';
       } else {
         draftWarningsEl.style.display = 'none';
         draftWarningsEl.innerHTML = '';
       }
+      confirmPublishCheckbox.disabled = !canPublish;
+      confirmPublishCheckbox.checked = false;
+      publishButton.disabled = true;
     }
 
     verifyDraftLink.addEventListener('click', (e) => {

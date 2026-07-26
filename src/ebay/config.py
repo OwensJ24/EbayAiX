@@ -19,7 +19,12 @@ SELL_INVENTORY_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.inventory"
 # Read-only scope for fetching existing business policies/merchant location, so a
 # draft listing can include them when the account already has them set up.
 SELL_ACCOUNT_READONLY_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.account.readonly"
-DEFAULT_SCOPES: tuple[str, ...] = (SELL_INVENTORY_SCOPE, SELL_ACCOUNT_READONLY_SCOPE)
+# Base scope required by the Taxonomy API (get_category_suggestions in listing.py).
+# eBay user tokens only ever carry the scopes explicitly requested at consent time —
+# there's no implicit default — so without this, suggest_category_id() silently gets
+# a 403 from Taxonomy and every draft reports "No eBay category suggestion found."
+API_SCOPE = "https://api.ebay.com/oauth/api_scope"
+DEFAULT_SCOPES: tuple[str, ...] = (API_SCOPE, SELL_INVENTORY_SCOPE, SELL_ACCOUNT_READONLY_SCOPE)
 
 _REQUIRED_ENV_VARS = ("EBAY_APP_ID", "EBAY_CERT_ID", "EBAY_RU_NAME")
 

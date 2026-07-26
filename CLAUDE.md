@@ -70,9 +70,11 @@ and the Architecture section below for why this specifically needs production cr
 is optional — only needed if the app's own request-derived base URL is ever wrong for building the
 publicly-fetchable image URLs eBay needs when creating a draft listing.
 
-**If a previously-connected eBay account stops seeing business policies/location in draft listings**, it's
-because the OAuth scope was widened after that connection was made (`sell.account.readonly` added) — the
-stored refresh token doesn't retroactively gain scopes. Fix: click "Connect eBay account" again.
+**If a previously-connected eBay account stops seeing business policies/location/category suggestions in
+draft listings**, it's because the OAuth scope was widened after that connection was made
+(`sell.account.readonly`, then later the base `https://api.ebay.com/oauth/api_scope` needed for the Taxonomy
+API's category suggestions — see `config.py`'s `DEFAULT_SCOPES`) — the stored refresh token doesn't
+retroactively gain scopes. Fix: click "Connect eBay account" again.
 
 ## Deployment
 
@@ -166,6 +168,17 @@ the human review point (see the Seller Hub finding above). Publishing requires c
 confirmation checkbox ("I understand this will create a real, live eBay listing...") before the "Publish to
 eBay" button enables; clicking it posts to `POST /api/listing/publish/{offer_id}`, which calls
 `publish_offer()` (see `src/ebay/listing.py` below) and returns a real, public `listing_url` on success.
+
+**The confirmation checkbox is disabled outright (not just a warning) whenever `result.missing` is
+non-empty.** `category`/`merchant_location`/`listing_policies` are each hard requirements for *publishing* an
+offer (unlike creating the draft, which succeeds without them — see `create_draft_listing()` below), so
+letting the user attempt to publish anyway just wastes a round-trip to eBay for a guaranteed failure. This
+was discovered from a real production error: `publishOffer` returned `errorId 25002` with the message
+`"No <Item.Country> exists..."`, which sounds like a missing address field but actually means **no inventory
+location (merchantLocationKey) is set up on the eBay account** — confirmed via eBay developer community
+threads, the same kind of misleadingly-worded eBay error as the earlier `Content-Language`/25709 case. Fixing
+it requires the user to set up a shipping/inventory location in eBay's own Seller Hub — outside this
+codebase's control, same as the Business Policies opt-in below.
 
 The `VisionPreprocessor`/`VisionSubagent` instances are constructed once at module import time and reused
 across requests — re-instantiating per request would reload the ResNet50 weights every call. `_call_claude()`

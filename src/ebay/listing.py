@@ -121,6 +121,7 @@ def suggest_category_id(config: EbayConfig, token: str, query: str) -> str | Non
         response.raise_for_status()
         suggestions = response.json().get("categorySuggestions", [])
         if not suggestions:
+            logger.info("suggest_category_id degraded: no suggestions returned for query=%r", query)
             return None
         return suggestions[0]["category"]["categoryId"]
     except httpx.HTTPStatusError as e:
@@ -139,9 +140,15 @@ def get_merchant_location_key(config: EbayConfig, token: str) -> str | None:
             params={"limit": 1},
             timeout=15.0,
         )
+        logger.info(
+            "get_merchant_location_key response: status=%d body=%s",
+            response.status_code,
+            response.text,
+        )
         response.raise_for_status()
         data = response.json()
         if data.get("total", 0) < 1:
+            logger.info("get_merchant_location_key degraded: account reports zero inventory locations")
             return None
         return data["locations"][0]["merchantLocationKey"]
     except httpx.HTTPStatusError as e:
