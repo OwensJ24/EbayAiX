@@ -20,7 +20,13 @@ from pydantic import BaseModel
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, search_comparable_listings
 from src.ebay.config import load_ebay_config
-from src.ebay.listing import create_draft_listing, create_inventory_location, get_offer, publish_offer
+from src.ebay.listing import (
+    create_draft_listing,
+    create_inventory_location,
+    get_offer,
+    publish_offer,
+    update_draft_listing,
+)
 from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.web.ebay_routes import router as ebay_router
@@ -259,7 +265,52 @@ def create_draft_listing_route(payload: DraftListingRequest, request: Request) -
         payload.weight_lbs,
         payload.currency,
     )
-    path.unlink(missing_ok=True)
+    # The file is deliberately KEPT here (not deleted) — eBay fetches imageUrls lazily,
+    # not synchronously during createOrReplaceInventoryItem, so deleting it this early
+    # was causing published listings to show "image not available": by the time eBay
+    # actually fetched it (around publish time), the file was already gone. It now only
+    # gets deleted once publish_offer_route() actually succeeds (see below), or the
+    # identify/refine call that produced it failed outright.
+    return {"status": "complete", "result": result.model_dump()}
+
+
+class UpdateDraftListingRequest(BaseModel):
+    identification: ProductIdentification
+    upload_id: str
+    sku: str
+    price: float
+    weight_lbs: float
+    currency: str = "USD"
+    category_query: str | None = None
+
+
+@app.post("/api/listing/draft/{offer_id}/update")
+def update_draft_listing_route(offer_id: str, payload: UpdateDraftListingRequest, request: Request) -> dict:
+    """Applies edits made in the review screen (title/brand/condition/description/
+    category/price/weight) to the already-created draft, in place — the automatic
+    identification and category suggestion can be wrong, and this is the human's chance
+    to fix it before publishing."""
+    matches = list(UPLOAD_DIR.glob(f"{payload.upload_id}.*"))
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail="Upload not found — the image may have been removed. Start a new draft instead.",
+        )
+    path = matches[0]
+
+    image_url = f"{_public_base_url(request)}/uploads/{path.name}"
+    result = _call_ebay(
+        update_draft_listing,
+        offer_id,
+        payload.sku,
+        payload.identification,
+        image_url,
+        payload.price,
+        payload.weight_lbs,
+        payload.currency,
+        1,
+        payload.category_query,
+    )
     return {"status": "complete", "result": result.model_dump()}
 
 
@@ -274,8 +325,12 @@ def get_draft_listing_route(offer_id: str) -> dict:
     return {"status": "complete", "result": offer}
 
 
+class PublishRequest(BaseModel):
+    upload_id: str | None = None
+
+
 @app.post("/api/listing/publish/{offer_id}")
-def publish_offer_route(offer_id: str) -> dict:
+def publish_offer_route(offer_id: str, payload: PublishRequest) -> dict:
     """Make a previously-created draft offer live and publicly purchasable on
     eBay. eBay's Seller Hub has no view for API-created unpublished offers, so
     this app's own listing-preview screen is the Human-in-the-Loop review step
@@ -284,4 +339,10 @@ def publish_offer_route(offer_id: str) -> dict:
     config = _call_ebay(load_ebay_config)
     token = _call_ebay(get_valid_access_token, config)
     result = _call_ebay(publish_offer, config, token, offer_id)
+    # Only now — once eBay has actually taken the listing live — is it safe to remove
+    # the source image. Deleting it any earlier (as create_draft_listing_route used to)
+    # meant eBay's lazy imageUrls fetch could happen after the file was already gone.
+    if payload.upload_id:
+        for match in UPLOAD_DIR.glob(f"{payload.upload_id}.*"):
+            match.unlink(missing_ok=True)
     return {"status": "complete", "result": result.model_dump()}

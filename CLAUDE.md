@@ -136,10 +136,13 @@ disk. The frontend (`src/web/static/index.html`, vanilla JS) then prompts the us
 posts it to `POST /api/identify/refine`, which re-runs `VisionSubagent.identify(..., user_provided_name=...)`
 with that hint folded into the prompt and always returns a final result (no further clarification loop).
 **Both endpoints now return `upload_id` on every response and keep the file on disk** (this changed —
-they used to delete it once a final result was ready) — the file is only deleted once a draft listing is
-successfully created (`POST /api/listing/draft`, see below) or the identify/refine call itself fails. A
-user who abandons the flow after identifying but before creating a draft leaves an orphaned file in
-`data/uploads/`; no cleanup job exists for this (accepted tradeoff, not a bug).
+they used to delete it once a final result was ready) — the file now stays on disk through draft creation
+*and* any edits, and is only deleted once `publish_offer_route()` actually succeeds, or the identify/refine
+call itself fails. It used to be deleted right after draft creation, which was a real bug: eBay fetches
+`imageUrls` lazily rather than synchronously during `createOrReplaceInventoryItem`, so by the time eBay
+actually fetched the image (around publish time), the file was already gone — surfacing as "image not
+available" on real, live, published listings. A user who abandons the flow entirely (never publishes) leaves
+an orphaned file in `data/uploads/`; no cleanup job exists for this (accepted tradeoff, not a bug).
 
 **Local ResNet50 inference is serialized across requests via `_inference_lock` (a plain `threading.Lock`).**
 Each sync FastAPI route runs in its own thread-pool thread, so without this, multiple images uploaded in
@@ -179,13 +182,22 @@ rather than something the pipeline can infer). A "Create Draft Listing" button p
 `GET /uploads/{filename}` (a `StaticFiles` mount — upload IDs are `uuid4().hex`, unguessable enough that
 serving them without auth is an accepted tradeoff for this portfolio project's scale).
 
-Once a draft is created, the frontend renders a full listing preview client-side (image, title, brand,
-condition, price, description — reconstructed from the same `ProductIdentification` data already in memory,
-not re-fetched) plus any `missing`/`notes` gaps from the draft result. This preview, not eBay's Seller Hub, is
-the human review point (see the Seller Hub finding above). Publishing requires checking an explicit
-confirmation checkbox ("I understand this will create a real, live eBay listing...") before the "Publish to
-eBay" button enables; clicking it posts to `POST /api/listing/publish/{offer_id}`, which calls
-`publish_offer()` (see `src/ebay/listing.py` below) and returns a real, public `listing_url` on success.
+Once a draft is created, the frontend shows an **editable** review form (title, brand, condition dropdown,
+eBay category search terms, description, plus the existing price/weight inputs), pre-filled from the same
+`ProductIdentification` already in memory, plus any `missing`/`notes` gaps and resolved `aspects` from the
+draft result. This form, not eBay's Seller Hub, is the human review *and correction* point (see the Seller
+Hub finding above) — the automatic identification/category-suggestion pipeline can be wrong, so every field
+that matters for a correct listing (title, brand, condition, category, description) is editable here, not
+just visible. A "Save Changes" button posts the edited fields to
+`POST /api/listing/draft/{offer_id}/update`, which calls `update_draft_listing()` (see `src/ebay/listing.py`
+below) — this updates the *same* SKU/offer in place (both underlying eBay calls are idempotent PUTs), so
+edits don't create a duplicate listing. The edited description textarea becomes the new `condition_notes`
+directly (with `distinguishing_features` cleared) rather than being reconstructed from separate fields, so a
+second edit doesn't duplicate content. Publishing requires checking an explicit confirmation checkbox ("I
+understand this will create a real, live eBay listing...") before the "Publish to eBay" button enables;
+clicking it posts to `POST /api/listing/publish/{offer_id}` (now with `{upload_id}` in the body — see the
+image-lifecycle note above), which calls `publish_offer()` (see `src/ebay/listing.py` below) and returns a
+real, public `listing_url` on success.
 
 **The confirmation checkbox is disabled outright (not just a warning) whenever `result.missing` is
 non-empty.** `category`/`merchant_location`/`listing_policies` are each hard requirements for *publishing* an
@@ -217,17 +229,30 @@ development; `_call_ebay()` additionally catches the `RuntimeError` that `load_e
 `load_ebay_browse_config()`/`get_valid_access_token()` raise for missing env vars or a not-yet-connected
 eBay account — this used to reach the client as a bare 500 before `_call_ebay()` existed.
 
-**`src/ebay/listing.py`** — creates a draft eBay listing, and separately, optionally publishes it.
-`create_draft_listing()` orchestrates: `suggest_category_id()` via the Taxonomy API (must run *first* — both
-condition and required-aspect resolution below depend on knowing the category) -> `resolve_condition()` ->
-`resolve_aspects()` -> `createOrReplaceInventoryItem` (PUT — title/description/condition/image/aspects from
-the `ProductIdentification`) -> further best-effort enrichment (`get_merchant_location_key()` via the
-Location API, `get_listing_policies()` via the Account API — each independently swallows failures and
-returns `None`/`{}` rather than raising, since none of these are required to create a valid draft, only to
-*publish* one) -> `createOffer` (POST, `format: "FIXED_PRICE"`, omitting
-`categoryId`/`merchantLocationKey`/`listingPolicies` entirely when not found, never sending them as `null`).
-The result (`DraftListingResult`) reports which pieces were `included` vs. `missing`, with human-readable
-`notes` for each gap.
+**`src/ebay/listing.py`** — creates a draft eBay listing, lets it be edited in place, and separately,
+optionally publishes it. The category/condition/aspects/location/policy resolution logic is shared via
+`_resolve_listing_data()` (returns a `_ResolvedListingData`) between `create_draft_listing()` and
+`update_draft_listing()`, since both need the exact same steps — only what happens with the result (POST a
+new offer vs. PUT an update to an existing one) differs. Order: `suggest_category_id()` via the Taxonomy API
+(must run *first* — both condition and required-aspect resolution depend on knowing the category) ->
+`resolve_condition()` -> `resolve_aspects()` -> `get_merchant_location_key()` via the Location API ->
+`get_listing_policies()` via the Account API (each of the latter two independently swallows failures and
+returns `None`/`{}` rather than raising, since neither is required to create a valid draft, only to
+*publish* one).
+
+`create_draft_listing()`: `_resolve_listing_data()` -> `createOrReplaceInventoryItem` (PUT) ->
+`createOffer` (POST, `format: "FIXED_PRICE"`, omitting `categoryId`/`merchantLocationKey`/`listingPolicies`
+entirely when not found, never sending them as `null`). `update_draft_listing()`: same
+`_resolve_listing_data()` call (optionally driven by a user-edited `category_query` instead of
+`build_query(identification)`) -> `createOrReplaceInventoryItem` again (same SKU — idempotent PUT, updates
+the existing inventory item in place) -> `update_offer()` (PUT to `/sell/inventory/v1/offer/{offerId}`, same
+`offer_id` — eBay's updateOffer is a full-replacement PUT like createOrReplaceInventoryItem, not a partial
+patch, so the whole payload is rebuilt fresh via the same `_build_offer_payload()` rather than merged with
+the prior offer state; safe to change `categoryId` here specifically because the offer is still
+unpublished — this is a different, unsupported operation on an already-*published* listing, which this
+codebase doesn't attempt). Both functions return the same `DraftListingResult` shape (`included`/`missing`/
+`notes`/`aspects`/`category_query`), so the frontend's review form can be redrawn identically after either a
+create or a save.
 
 **Required item specifics ("aspects") are resolved per category, not just Brand.** Many eBay categories
 reject listing creation outright if required aspects are missing — e.g. Headphones requires

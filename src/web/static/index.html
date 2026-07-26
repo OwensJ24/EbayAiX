@@ -78,8 +78,30 @@
   </div>
 
   <div id="previewSection" style="display:none;">
-    <label>Review before publishing</label>
-    <div id="listingPreview"></div>
+    <label>Review and edit before publishing</label>
+    <div class="listing-preview">
+      <img id="previewListingImg" alt="listing image">
+      <label for="editTitle">Title</label>
+      <input type="text" id="editTitle" maxlength="80">
+      <label for="editBrand">Brand</label>
+      <input type="text" id="editBrand">
+      <label for="editCondition">Condition</label>
+      <select id="editCondition">
+        <option value="New">New</option>
+        <option value="Like New">Like New</option>
+        <option value="Very Good">Very Good</option>
+        <option value="Good">Good</option>
+        <option value="Acceptable">Acceptable</option>
+        <option value="For Parts">For Parts</option>
+      </select>
+      <label for="editCategoryQuery">eBay category search terms</label>
+      <input type="text" id="editCategoryQuery">
+      <label for="editDescription">Description</label>
+      <textarea id="editDescription" rows="6" style="width:100%; box-sizing:border-box; padding:0.4rem; margin-top:0.5rem; font-family:inherit;"></textarea>
+      <div id="aspectsDisplay"></div>
+    </div>
+    <button id="saveChangesButton">Save Changes</button>
+    <div id="saveStatus"></div>
     <div class="warning" id="draftWarnings" style="display:none;"></div>
     <p style="font-size:0.85rem;"><a href="#" id="verifyDraftLink">Verify draft via eBay API</a></p>
     <div id="verifyResult"></div>
@@ -113,7 +135,15 @@
     const draftButton = document.getElementById('draftButton');
     const draftStatusEl = document.getElementById('draftStatus');
     const previewSection = document.getElementById('previewSection');
-    const listingPreviewEl = document.getElementById('listingPreview');
+    const previewListingImg = document.getElementById('previewListingImg');
+    const editTitle = document.getElementById('editTitle');
+    const editBrand = document.getElementById('editBrand');
+    const editCondition = document.getElementById('editCondition');
+    const editCategoryQuery = document.getElementById('editCategoryQuery');
+    const editDescription = document.getElementById('editDescription');
+    const aspectsDisplayEl = document.getElementById('aspectsDisplay');
+    const saveChangesButton = document.getElementById('saveChangesButton');
+    const saveStatusEl = document.getElementById('saveStatus');
     const draftWarningsEl = document.getElementById('draftWarnings');
     const verifyDraftLink = document.getElementById('verifyDraftLink');
     const verifyResultEl = document.getElementById('verifyResult');
@@ -216,6 +246,7 @@
       draftStatusEl.innerHTML = '';
       previewSection.style.display = 'none';
       publishStatusEl.innerHTML = '';
+      saveStatusEl.innerHTML = '';
       verifyResultEl.innerHTML = '';
       confirmPublishCheckbox.checked = false;
       confirmPublishCheckbox.disabled = false;
@@ -331,7 +362,8 @@
         .then((data) => {
           currentDraftResult = data.result;
           draftStatusEl.innerHTML = `<p>Draft created — SKU <code>${escapeHtml(currentDraftResult.sku)}</code>, offer <code>${escapeHtml(currentDraftResult.offer_id)}</code>.</p>`;
-          renderListingPreview(currentDraftResult, price, weightLbs);
+          populateEditForm(currentIdentification, currentDraftResult.category_query);
+          refreshDraftMeta(currentDraftResult);
           previewSection.style.display = 'block';
         })
         .catch((err) => {
@@ -342,39 +374,46 @@
         });
     });
 
-    function renderListingPreview(draftResult, price, weightLbs) {
-      const id = currentIdentification;
-      const descriptionLines = [id.condition_notes];
-      if (id.distinguishing_features && id.distinguishing_features.length) {
-        descriptionLines.push('Notable features:');
-        id.distinguishing_features.forEach((f) => descriptionLines.push(`- ${f}`));
-      }
+    // Fills the edit form from a fresh ProductIdentification — called once, right after
+    // a draft is first created. Not called again after Save Changes, since at that point
+    // the fields already show exactly what was just saved.
+    function populateEditForm(identification, categoryQuery) {
+      previewListingImg.src = preview.src;
+      editTitle.value = identification.item_name;
+      editBrand.value = identification.brand || '';
+      editCondition.value = identification.condition;
+      editCategoryQuery.value = categoryQuery || '';
 
-      let html = '<div class="listing-preview">';
-      html += `<img src="${preview.src}" alt="listing image">`;
-      html += `<h3>${escapeHtml(id.item_name)}</h3>`;
-      if (id.brand) html += `<p><strong>Brand:</strong> ${escapeHtml(id.brand)}</p>`;
-      html += `<p><strong>Condition:</strong> ${escapeHtml(id.condition)}</p>`;
-      html += `<p><strong>Price:</strong> $${price.toFixed(2)} USD</p>`;
-      html += `<p><strong>Package weight:</strong> ${weightLbs.toFixed(1)} lbs</p>`;
-      html += `<p><strong>Description:</strong></p><pre>${escapeHtml(descriptionLines.join('\n'))}</pre>`;
+      const descriptionLines = [identification.condition_notes];
+      if (identification.distinguishing_features && identification.distinguishing_features.length) {
+        descriptionLines.push('Notable features:');
+        identification.distinguishing_features.forEach((f) => descriptionLines.push(`- ${f}`));
+      }
+      editDescription.value = descriptionLines.join('\n');
+    }
+
+    // Refreshes the read-only bits driven by the latest DraftListingResult — aspects,
+    // missing-prerequisite warnings, and whether the publish checkbox may be enabled.
+    // Called after both initial creation and every Save Changes.
+    function refreshDraftMeta(draftResult) {
       const aspectEntries = Object.entries(draftResult.aspects || {});
       if (aspectEntries.length) {
-        html += '<p><strong>Item specifics eBay requires:</strong></p><ul>';
+        let html = '<p><strong>Item specifics eBay requires:</strong></p><ul>';
         html += aspectEntries.map(([name, values]) => `<li>${escapeHtml(name)}: ${escapeHtml(values.join(', '))}</li>`).join('');
         html += '</ul>';
         if (aspectEntries.some(([, values]) => values.includes('Not Specified'))) {
-          html += '<p style="font-size:0.85rem; color:#8a6d00;">Some of these were auto-filled with a generic placeholder since they couldn\'t be determined from the photo — worth correcting via eBay after publishing if inaccurate.</p>';
+          html += '<p style="font-size:0.85rem; color:#8a6d00;">Some of these were auto-filled with a generic placeholder since they couldn\'t be determined — worth correcting via eBay after publishing if inaccurate.</p>';
         }
+        aspectsDisplayEl.innerHTML = html;
+      } else {
+        aspectsDisplayEl.innerHTML = '';
       }
-      html += '</div>';
-      listingPreviewEl.innerHTML = html;
 
       // category/merchant_location/listing_policies are each required by eBay to
-      // *publish* an offer (unlike creating the draft/offer itself, which succeeds
-      // without them) — if any are missing, publishing is guaranteed to fail with a
-      // confusing eBay error (e.g. a mislabeled "Item.Country" error that actually
-      // means "no inventory location on this account"), so block it here instead.
+      // *publish* an offer (unlike creating/updating the draft/offer itself, which
+      // succeeds without them) — if any are missing, publishing is guaranteed to fail
+      // with a confusing eBay error (e.g. a mislabeled "Item.Country" error that
+      // actually means "no inventory location on this account"), so block it here.
       const canPublish = draftResult.missing.length === 0;
       if (!canPublish) {
         draftWarningsEl.innerHTML = `<strong>Can't publish yet — finish these in eBay Seller Hub first, then come back:</strong><ul>${draftResult.notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
@@ -387,6 +426,72 @@
       confirmPublishCheckbox.checked = false;
       publishButton.disabled = true;
     }
+
+    saveChangesButton.addEventListener('click', () => {
+      if (!currentDraftResult || !currentUploadId) return;
+
+      const price = parseFloat(priceInput.value);
+      if (!(price > 0)) {
+        saveStatusEl.innerHTML = '<p class="error">Enter a price greater than 0.</p>';
+        return;
+      }
+      const weightLbs = parseFloat(weightInput.value);
+      if (!(weightLbs > 0)) {
+        saveStatusEl.innerHTML = '<p class="error">Enter a package weight greater than 0.</p>';
+        return;
+      }
+      const title = editTitle.value.trim();
+      if (!title) {
+        saveStatusEl.innerHTML = '<p class="error">Title cannot be empty.</p>';
+        return;
+      }
+
+      // The edited description becomes the single source of truth for condition_notes;
+      // distinguishing_features is cleared so the description isn't reconstructed with
+      // duplicated content on a later edit.
+      const updatedIdentification = {
+        ...currentIdentification,
+        item_name: title,
+        brand: editBrand.value.trim() || null,
+        condition: editCondition.value,
+        condition_notes: editDescription.value,
+        distinguishing_features: [],
+      };
+
+      saveChangesButton.disabled = true;
+      saveStatusEl.textContent = 'Saving changes to eBay…';
+
+      fetch(`/api/listing/draft/${currentDraftResult.offer_id}/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identification: updatedIdentification,
+          upload_id: currentUploadId,
+          sku: currentDraftResult.sku,
+          price,
+          weight_lbs: weightLbs,
+          category_query: editCategoryQuery.value.trim() || null,
+        }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then((data) => {
+          currentIdentification = updatedIdentification;
+          currentDraftResult = data.result;
+          editCategoryQuery.value = currentDraftResult.category_query;
+          saveStatusEl.innerHTML = '<p>Changes saved.</p>';
+          refreshDraftMeta(currentDraftResult);
+        })
+        .catch((err) => {
+          saveStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          saveChangesButton.disabled = false;
+        });
+    });
 
     verifyDraftLink.addEventListener('click', (e) => {
       e.preventDefault();
@@ -417,7 +522,11 @@
       confirmPublishCheckbox.disabled = true;
       publishStatusEl.textContent = 'Publishing to eBay — this will make the listing live…';
 
-      fetch(`/api/listing/publish/${currentDraftResult.offer_id}`, { method: 'POST' })
+      fetch(`/api/listing/publish/${currentDraftResult.offer_id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ upload_id: currentUploadId }),
+      })
         .then(async (res) => {
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Request failed');

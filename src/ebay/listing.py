@@ -488,6 +488,44 @@ def create_offer(
     return response.json()["offerId"]
 
 
+def update_offer(
+    config: EbayConfig,
+    token: str,
+    offer_id: str,
+    sku: str,
+    price: float,
+    currency: str,
+    quantity: int,
+    category_id: str | None,
+    merchant_location_key: str | None,
+    listing_policies: dict[str, str],
+) -> None:
+    """Updates an already-created (unpublished) offer in place — eBay's updateOffer is a
+    full replacement PUT (like createOrReplaceInventoryItem), not a partial patch, so
+    this rebuilds the whole payload fresh rather than merging with the existing offer.
+    Safe to call on a category change since the offer is still unpublished; changing
+    category on an already-*published* listing is a different, unsupported operation
+    this codebase doesn't attempt.
+    """
+    payload = _build_offer_payload(sku, price, currency, quantity, category_id, merchant_location_key, listing_policies)
+    logger.info(
+        "updateOffer request: url=%s payload=%s", f"{config.api_base}/sell/inventory/v1/offer/{offer_id}", payload
+    )
+    response = httpx.put(
+        f"{config.api_base}/sell/inventory/v1/offer/{offer_id}",
+        headers=_auth_headers(token),
+        json=payload,
+        timeout=20.0,
+    )
+    logger.info(
+        "updateOffer response: status=%d headers=%s body=%s",
+        response.status_code,
+        dict(response.headers),
+        response.text,
+    )
+    response.raise_for_status()
+
+
 def get_offer(config: EbayConfig, token: str, offer_id: str) -> dict:
     """Fetch a previously-created offer directly from eBay's API.
 
@@ -511,36 +549,43 @@ class DraftListingResult(BaseModel):
     missing: list[str]
     notes: list[str]
     aspects: dict[str, list[str]] = {}
+    category_query: str = ""
 
 
-def create_draft_listing(
-    identification: ProductIdentification,
-    upload_id: str,
-    image_url: str,
-    price: float,
-    weight_lbs: float,
-    currency: str = "USD",
-    quantity: int = 1,
-) -> DraftListingResult:
-    config = load_ebay_config()
-    token = get_valid_access_token(config)
-    sku = generate_sku(upload_id)
+class _ResolvedListingData(BaseModel):
+    category_id: str | None
+    condition_enum: str
+    aspects: dict[str, list[str]]
+    merchant_location_key: str | None
+    listing_policies: dict[str, str]
+    included: list[str]
+    missing: list[str]
+    notes: list[str]
 
+
+def _resolve_listing_data(
+    config: EbayConfig, token: str, identification: ProductIdentification, query: str
+) -> _ResolvedListingData:
+    """Shared by create_draft_listing() and update_draft_listing(): resolves
+    category/condition/aspects/location/policies from `identification` and the given
+    category search query. Raises RuntimeError for a genuinely unresolvable required
+    aspect (see resolve_aspects) — fails fast rather than letting a guaranteed eBay
+    rejection happen downstream.
+    """
     included: list[str] = []
     missing: list[str] = []
     notes: list[str] = []
 
-    # Category must be known before the inventory item is created, since the item's
-    # condition has to already be one this category allows (see resolve_condition) —
-    # eBay validates condition-vs-category downstream and rejects the mismatch with a
-    # cryptic errorId 25021, so this order minimizes the chance of that round-trip.
-    query = build_query(identification)
+    # Category must be known before the inventory item is built, since the item's
+    # condition/aspects have to already be ones this category allows — eBay validates
+    # condition-vs-category and required-aspects downstream and rejects mismatches with
+    # cryptic errors (25021, 25002), so resolving this first minimizes those round-trips.
     category_id = suggest_category_id(config, token, query)
     if category_id:
         included.append("category")
     else:
         missing.append("category")
-        notes.append("No eBay category suggestion found — set one manually before publishing.")
+        notes.append("No eBay category suggestion found — try more specific category search terms.")
 
     condition_enum, condition_confirmed = resolve_condition(config, token, category_id, identification.condition)
     if category_id and not condition_confirmed:
@@ -563,18 +608,13 @@ def create_draft_listing(
             # into an unpublished offer at all (see module docstring).
             raise RuntimeError(
                 "eBay requires a value for these item specifics in the detected category, and it "
-                f"couldn't be determined automatically from the photo: {', '.join(unresolved_aspects)}. "
-                "Try again with a clearer photo or a more descriptive item name."
+                f"couldn't be determined automatically: {', '.join(unresolved_aspects)}. Try editing the "
+                "title/description with more detail, or a more specific category search."
             )
     elif identification.brand:
         # No category means no aspect requirements are known at all — still send Brand
         # since we have it and it's almost always accepted regardless of category.
         aspects = {"Brand": [identification.brand]}
-
-    create_or_replace_inventory_item(
-        config, token, sku, identification, image_url, condition_enum, aspects, weight_lbs, quantity
-    )
-    included.append("inventory_item")
 
     merchant_location_key = get_merchant_location_key(config, token)
     if merchant_location_key:
@@ -594,18 +634,96 @@ def create_draft_listing(
             "/ebay/connect to enable policy detection). Add them in Seller Hub before publishing."
         )
 
-    offer_id = create_offer(
-        config, token, sku, price, currency, quantity, category_id, merchant_location_key, listing_policies
+    return _ResolvedListingData(
+        category_id=category_id,
+        condition_enum=condition_enum,
+        aspects=aspects,
+        merchant_location_key=merchant_location_key,
+        listing_policies=listing_policies,
+        included=included,
+        missing=missing,
+        notes=notes,
     )
-    included.append("offer")
+
+
+def create_draft_listing(
+    identification: ProductIdentification,
+    upload_id: str,
+    image_url: str,
+    price: float,
+    weight_lbs: float,
+    currency: str = "USD",
+    quantity: int = 1,
+) -> DraftListingResult:
+    config = load_ebay_config()
+    token = get_valid_access_token(config)
+    sku = generate_sku(upload_id)
+
+    query = build_query(identification)
+    data = _resolve_listing_data(config, token, identification, query)
+
+    create_or_replace_inventory_item(
+        config, token, sku, identification, image_url, data.condition_enum, data.aspects, weight_lbs, quantity
+    )
+    data.included.append("inventory_item")
+
+    offer_id = create_offer(
+        config, token, sku, price, currency, quantity, data.category_id, data.merchant_location_key, data.listing_policies
+    )
+    data.included.append("offer")
 
     return DraftListingResult(
         sku=sku,
         offer_id=offer_id,
-        included=included,
-        missing=missing,
-        notes=notes,
-        aspects=aspects,
+        included=data.included,
+        missing=data.missing,
+        notes=data.notes,
+        aspects=data.aspects,
+        category_query=query,
+    )
+
+
+def update_draft_listing(
+    offer_id: str,
+    sku: str,
+    identification: ProductIdentification,
+    image_url: str,
+    price: float,
+    weight_lbs: float,
+    currency: str = "USD",
+    quantity: int = 1,
+    category_query: str | None = None,
+) -> DraftListingResult:
+    """Re-applies edited fields to an already-created (unpublished) offer — the
+    frontend's review screen lets the user correct title/brand/condition/description/
+    category before publishing, since the automatic identification and category
+    suggestion can be wrong. Reuses the same SKU and offer_id (both calls below are
+    idempotent PUTs), so this updates in place rather than creating a duplicate.
+    """
+    config = load_ebay_config()
+    token = get_valid_access_token(config)
+
+    query = category_query or build_query(identification)
+    data = _resolve_listing_data(config, token, identification, query)
+
+    create_or_replace_inventory_item(
+        config, token, sku, identification, image_url, data.condition_enum, data.aspects, weight_lbs, quantity
+    )
+    data.included.append("inventory_item")
+
+    update_offer(
+        config, token, offer_id, sku, price, currency, quantity, data.category_id, data.merchant_location_key, data.listing_policies
+    )
+    data.included.append("offer")
+
+    return DraftListingResult(
+        sku=sku,
+        offer_id=offer_id,
+        included=data.included,
+        missing=data.missing,
+        notes=data.notes,
+        aspects=data.aspects,
+        category_query=query,
     )
 
 
