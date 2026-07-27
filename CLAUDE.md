@@ -232,12 +232,20 @@ indefinitely for abandoned flows — the old "no cleanup job" limitation for `da
 route from that point on (`/api/listing/draft`, `.../update`, `/api/listing/publish/{offer_id}`) needs zero
 local file access at all — `public_url(config, upload_id)` reconstructs the Supabase image URL purely from
 the deterministic `{upload_id}.jpg` naming, no existence check needed, since `upload_image()` already
-succeeded synchronously back in `/api/identify` (if that failed, the flow never got this far). The Supabase
-object itself is only deleted once `publish_offer_route()` actually succeeds — eBay fetches `imageUrls`
-lazily rather than synchronously at inventory-item-creation time, so deleting any earlier was a real,
-previously-hit bug ("image not available" on real, live, published listings). A user who abandons the flow
-before publishing leaves an orphaned Supabase object; no cleanup job exists for this (accepted tradeoff, same
-as before, just moved to different storage).
+succeeded synchronously back in `/api/identify` (if that failed, the flow never got this far).
+
+**The Supabase object is never automatically deleted, even after a successful publish — this was tried and
+reverted after a real recurrence of the "image not available" bug.** The first version of this integration
+deleted it right after `publish_offer_route()`'s `publish_offer()` call returned, on the reasoning that
+publish success meant eBay was done needing the image. That reasoning was wrong: `publishOffer` returning
+success doesn't mean eBay has actually *fetched* `imageUrls` yet — that fetch is lazy/asynchronous, the exact
+same behavior that caused the original pre-Supabase version of this bug — so deleting immediately after
+publish recreated the same race condition one layer further down the pipeline. Confirmed the Supabase upload
+and public-URL fetch both work correctly in isolation (a live round-trip test: upload, then an unauthenticated
+GET exactly simulating eBay's fetch, returned the correct bytes and content-type) before concluding the
+premature deletion was the actual cause. Fix: don't delete it at all. A user who abandons the flow, or a
+published listing, both leave a permanent Supabase object; no cleanup job exists for this (same accepted
+tradeoff this codebase already made for local uploads, just without an automatic deletion point at all now).
 
 **Local ResNet50 inference is serialized across requests via `_inference_lock` (a plain `threading.Lock`).**
 Each sync FastAPI route runs in its own thread-pool thread, so without this, multiple images uploaded in
@@ -341,9 +349,12 @@ secret key, plus `x-upsert: true` so re-running identify for the same `upload_id
 rather than erroring), `public_url()` (pure string construction from `{SUPABASE_URL}/storage/v1/object/public
 /{bucket}/{upload_id}.jpg` — deterministic, never checks existence), and `delete_image()` (`DELETE
 /storage/v1/object/{bucket}` with a JSON `{"prefixes": [...]}` body — Supabase's batch-delete shape, confirmed
-against Supabase's own API docs rather than assumed; best-effort, logs failures instead of raising, since a
-lingering Supabase object after a successful publish is a much smaller problem than surfacing an error to the
-user at that point). **Why Supabase and not this app's own `/uploads` endpoint** (the prior design, now
+against Supabase's own API docs rather than assumed; best-effort, logs failures instead of raising). Both
+`upload_image()` and `public_url()` log their request/response and the final URL via `logger.info()` — this
+was added specifically to debug a real "image not available" recurrence (see the note on `publish_offer_route()`
+below); `delete_image()` exists as a usable utility (e.g. for a future manual cleanup script) but **nothing
+in this codebase currently calls it** — see below for why. **Why Supabase and not this app's own `/uploads`
+endpoint** (the prior design, now
 removed along with `PUBLIC_BASE_URL`): Render's free tier spins down after inactivity, but eBay fetches
 `imageUrls` lazily rather than synchronously when a draft is created — so the old design had a real
 reliability gap where eBay's fetch could land while this app's own instance was asleep. Supabase Storage has

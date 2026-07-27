@@ -79,14 +79,14 @@ def upload_image(config: SupabaseStorageConfig, upload_id: str, contents: bytes)
         "Content-Type": "image/jpeg",
         "x-upsert": "true",  # re-running identify for the same upload_id overwrites cleanly
     }
-    response = httpx.post(
-        f"{config.url}/storage/v1/object/{config.bucket}/{path}",
-        headers=headers,
-        content=contents,
-        timeout=30.0,
-    )
+    url = f"{config.url}/storage/v1/object/{config.bucket}/{path}"
+    logger.info("Supabase upload request: url=%s bytes=%d", url, len(contents))
+    response = httpx.post(url, headers=headers, content=contents, timeout=30.0)
+    logger.info("Supabase upload response: status=%d body=%s", response.status_code, response.text[:500])
     response.raise_for_status()
-    return public_url(config, upload_id)
+    result_url = public_url(config, upload_id)
+    logger.info("Supabase public URL: %s", result_url)
+    return result_url
 
 
 def delete_image(config: SupabaseStorageConfig, upload_id: str) -> None:

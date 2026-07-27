@@ -31,7 +31,7 @@ from src.ebay.listing import (
 )
 from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
-from src.storage.supabase_storage import delete_image, load_supabase_storage_config, public_url, upload_image
+from src.storage.supabase_storage import load_supabase_storage_config, public_url, upload_image
 from src.web.ebay_routes import router as ebay_router
 
 # INFO-level logs (e.g. src.ebay.listing's request/response diagnostics) are silently
@@ -430,12 +430,8 @@ def get_draft_listing_route(offer_id: str) -> dict:
     return {"status": "complete", "result": offer}
 
 
-class PublishRequest(BaseModel):
-    upload_id: str | None = None
-
-
 @app.post("/api/listing/publish/{offer_id}")
-def publish_offer_route(offer_id: str, payload: PublishRequest) -> dict:
+def publish_offer_route(offer_id: str) -> dict:
     """Make a previously-created draft offer live and publicly purchasable on
     eBay. eBay's Seller Hub has no view for API-created unpublished offers, so
     this app's own listing-preview screen is the Human-in-the-Loop review step
@@ -444,12 +440,12 @@ def publish_offer_route(offer_id: str, payload: PublishRequest) -> dict:
     config = _call_ebay(load_ebay_config)
     token = _call_ebay(get_valid_access_token, config)
     result = _call_ebay(publish_offer, config, token, offer_id)
-    # Only now — once eBay has actually taken the listing live — is it safe to remove
-    # the source image from Supabase Storage. Deleting it any earlier meant eBay's lazy
-    # imageUrls fetch could happen after the object was already gone. Best-effort:
-    # delete_image() logs failures rather than raising, since a lingering Supabase
-    # object is a much smaller problem than surfacing an error after publish succeeded.
-    if payload.upload_id:
-        storage_config = _call_storage(load_supabase_storage_config)
-        delete_image(storage_config, payload.upload_id)
+    # Deliberately NOT deleting the Supabase image here, even though eBay has by this
+    # point confirmed the listing is live. publishOffer returning success doesn't mean
+    # eBay has actually fetched imageUrls yet — that fetch is lazy/asynchronous (the
+    # same reasoning behind the original "image not available" bug), so there's no
+    # reliable point at which deleting the source image is provably safe. Leaving it in
+    # Supabase permanently is the same accepted tradeoff this codebase already makes for
+    # abandoned local uploads — accumulating storage is a much smaller problem than a
+    # real, live, published listing showing a broken image.
     return {"status": "complete", "result": result.model_dump()}

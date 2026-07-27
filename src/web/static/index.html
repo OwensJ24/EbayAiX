@@ -621,11 +621,7 @@
       confirmPublishCheckbox.disabled = true;
       publishStatusEl.textContent = 'Publishing to eBay — this will make the listing live…';
 
-      fetch(`/api/listing/publish/${currentDraftResult.offer_id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ upload_id: currentUploadId }),
-      })
+      fetch(`/api/listing/publish/${currentDraftResult.offer_id}`, { method: 'POST' })
         .then(async (res) => {
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Request failed');
