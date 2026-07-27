@@ -40,10 +40,18 @@ _SYSTEM_PROMPT = (
     "everything else: brand, model number, condition, and a description. Be conservative "
     "about condition: only claim 'New' if there is clear evidence (tags, packaging, no "
     "wear). If you cannot read a model number or brand, leave it null rather than "
-    "guessing. For content_description, describe what the item is and what's visible or "
-    "included (color, accessories, ports, packaging contents) as a buyer-facing "
-    "paragraph — do NOT mention wear, damage, defects, or condition there; that belongs "
-    "only in condition_notes."
+    "guessing.\n\n"
+    "For content_description, write it like a real, simple eBay listing description — "
+    "not a narrative about what the item is. The title is added separately and already "
+    "covers that; do not repeat it. Structure: (1) If this is a functional/electronic "
+    "item, confirm its functionality in one short line, e.g. 'Tested and working' — "
+    "unless the condition is 'For Parts' or otherwise non-functional, in which case say "
+    "so honestly instead (e.g. 'Sold for parts, not tested' or 'Not functional'). Omit "
+    "this line entirely for items where a working/non-working claim doesn't apply (e.g. "
+    "clothing, books, purely decorative items). (2) List relevant specifics as short, "
+    "plain facts — model number, style, size, material, color, included accessories — "
+    "whatever applies. Keep it brief and factual, not descriptive prose. Do NOT mention "
+    "wear, damage, defects, or condition here; that belongs only in condition_notes."
 )
 
 
@@ -61,7 +69,13 @@ class ProductIdentification(BaseModel):
     condition: Literal["New", "Like New", "Very Good", "Good", "Acceptable", "For Parts"]
     condition_notes: str = Field(description="Specific visible wear, damage, or missing parts supporting the condition rating")
     content_description: str = Field(
-        description="Buyer-facing paragraph describing what the item is and what's visible/included — no condition or wear commentary"
+        description=(
+            "eBay listing body text (the title is added separately — do not repeat it): a "
+            "short functionality confirmation line when applicable (e.g. 'Tested and "
+            "working', or an honest non-functional equivalent), followed by brief specifics "
+            "(model number, style, size, material, color, included accessories). No "
+            "condition/wear commentary — that belongs only in condition_notes."
+        )
     )
     distinguishing_features: list[str] = Field(
         description="Visible features useful for identifying the exact variant: color, ports, markings, included accessories"

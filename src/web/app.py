@@ -5,7 +5,6 @@ from __future__ import annotations
 import gc
 import io
 import logging
-import os
 import threading
 import uuid
 from pathlib import Path
@@ -13,7 +12,7 @@ from typing import Callable, TypeVar
 
 import anthropic
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -32,12 +31,14 @@ from src.ebay.listing import (
 )
 from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
+from src.storage.supabase_storage import delete_image, load_supabase_storage_config, public_url, upload_image
 from src.web.ebay_routes import router as ebay_router
 
 # INFO-level logs (e.g. src.ebay.listing's request/response diagnostics) are silently
 # dropped otherwise — Python's root logger defaults to WARNING, and nothing else in
 # this app configures logging.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -66,7 +67,6 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="AgentX")
 app.include_router(ebay_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Loaded once at process startup — ResNet50 weight loading and API client
 # construction are both too expensive to redo per request.
@@ -102,7 +102,15 @@ def _read_upload_within_limit(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _validate_and_normalize_image(contents: bytes, suffix: str) -> tuple[bytes, str]:
+def _validate_and_normalize_image(contents: bytes) -> bytes:
+    """Validates dimensions and always re-encodes to JPEG (downscaling first if needed)
+    — unconditionally, not just when downscaling. This keeps every upload's Supabase
+    Storage object path fully deterministic (`{upload_id}.jpg`, see
+    src/storage/supabase_storage.py), so nothing downstream ever needs to track or look
+    up the original file's format/extension. Minor tradeoff: already-small JPEGs get a
+    redundant re-compression pass at quality=88 (visually near-lossless for product
+    photos) instead of passing through untouched.
+    """
     try:
         image = Image.open(io.BytesIO(contents))
         image.load()
@@ -120,18 +128,12 @@ def _validate_and_normalize_image(contents: bytes, suffix: str) -> tuple[bytes, 
             ),
         )
 
-    if max(width, height) <= EBAY_MAX_IMAGE_DIMENSION:
-        return contents, suffix
-
-    # Always re-encode as JPEG when downscaling, regardless of original format —
-    # simplest way to keep the saved bytes, file extension, and served content-type all
-    # consistent after a resize (a .webp/.png extension paired with re-encoded JPEG
-    # bytes would otherwise mismatch what StaticFiles reports as Content-Type).
     image = image.convert("RGB")
-    image.thumbnail((EBAY_MAX_IMAGE_DIMENSION, EBAY_MAX_IMAGE_DIMENSION), Image.LANCZOS)
+    if max(width, height) > EBAY_MAX_IMAGE_DIMENSION:
+        image.thumbnail((EBAY_MAX_IMAGE_DIMENSION, EBAY_MAX_IMAGE_DIMENSION), Image.LANCZOS)
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=88)
-    return buf.getvalue(), ".jpg"
+    return buf.getvalue()
 
 
 def _save_upload(file: UploadFile) -> Path:
@@ -140,9 +142,9 @@ def _save_upload(file: UploadFile) -> Path:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'unknown'}")
 
     contents = _read_upload_within_limit(file, MAX_UPLOAD_BYTES)
-    contents, suffix = _validate_and_normalize_image(contents, suffix)
+    contents = _validate_and_normalize_image(contents)
     upload_id = uuid.uuid4().hex
-    path = UPLOAD_DIR / f"{upload_id}{suffix}"
+    path = UPLOAD_DIR / f"{upload_id}.jpg"
     path.write_bytes(contents)
     return path
 
@@ -181,6 +183,21 @@ def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
         raise HTTPException(status_code=502, detail=f"Unexpected error calling Claude: {type(e).__name__}: {e}")
 
 
+def _call_storage(fn: Callable[..., T], *args, **kwargs) -> T:
+    """Run a Supabase Storage-backed call, translating failures into clean HTTP errors."""
+    try:
+        return fn(*args, **kwargs)
+    except RuntimeError as e:
+        # load_supabase_storage_config() raises this for missing env vars.
+        raise HTTPException(status_code=400, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502, detail=f"Supabase Storage error: {e.response.status_code} {e.response.text[:300]}"
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="Could not reach Supabase Storage. Please try again.")
+
+
 @app.post("/api/identify")
 def identify(file: UploadFile = File(...)) -> dict:
     """Phase 1 of 2: a cheap preview guess (name + category) only — never the full
@@ -188,6 +205,13 @@ def identify(file: UploadFile = File(...)) -> dict:
     brand/model/condition/description get analyzed at all (see that route below)."""
     path = _save_upload(file)
     try:
+        # Uploaded to Supabase Storage immediately — this, not this app's own server,
+        # is what eBay will fetch imageUrls from later (see
+        # src/storage/supabase_storage.py for why: Render's free tier sleeps, but
+        # Supabase doesn't, and eBay fetches images lazily rather than synchronously).
+        storage_config = _call_storage(load_supabase_storage_config)
+        _call_storage(upload_image, storage_config, path.stem, path.read_bytes())
+
         with _inference_lock:
             local_result = _preprocessor.classify(path)
             # PyTorch's CPU allocator doesn't reliably return freed memory to the OS
@@ -209,9 +233,10 @@ def identify(file: UploadFile = File(...)) -> dict:
     app_token = _call_ebay(get_application_access_token, browse_config)
     suggestions = _call_ebay(suggest_categories, browse_config, app_token, preview.category)
 
-    # File is kept (not deleted) so the confirm step below can reference the image —
-    # it's only cleaned up once a listing is actually published, or if this request
-    # itself fails (see the except block above).
+    # The local file is kept only for the confirm step below, which also needs local
+    # classify()/Claude vision access — it's deleted right after that (see
+    # /api/identify/confirm), since everything downstream of confirmation (price lookup,
+    # draft creation, publish) uses the Supabase-hosted copy instead.
     return {
         "status": "preview",
         "upload_id": path.stem,
@@ -258,9 +283,14 @@ def confirm_item(payload: ConfirmItemRequest) -> dict:
         identification = _call_claude(
             _vision_subagent.identify, path, local_result, payload.item_name, payload.category_name
         )
-    except Exception:
+    finally:
+        # The local temp file is only ever needed for local classify()/Claude vision
+        # calls, both of which are done (successfully or not) by this point —
+        # everything downstream (price lookup, draft creation, publish) uses the
+        # Supabase-hosted copy uploaded back in /api/identify instead. Deleting it here
+        # unconditionally also means local uploads no longer accumulate indefinitely
+        # for abandoned flows the way they used to.
         path.unlink(missing_ok=True)
-        raise
 
     identification.category_id = payload.category_id
     return {"status": "complete", "upload_id": path.stem, "result": identification.model_dump()}
@@ -338,19 +368,12 @@ class DraftListingRequest(BaseModel):
     currency: str = "USD"
 
 
-def _public_base_url(request: Request) -> str:
-    override = os.environ.get("PUBLIC_BASE_URL")
-    return override.rstrip("/") if override else str(request.base_url).rstrip("/")
-
-
 @app.post("/api/listing/draft")
-def create_draft_listing_route(payload: DraftListingRequest, request: Request) -> dict:
-    matches = list(UPLOAD_DIR.glob(f"{payload.upload_id}.*"))
-    if not matches:
-        raise HTTPException(status_code=404, detail="Upload not found — it may have already been used or the server restarted")
-    path = matches[0]
-
-    image_url = f"{_public_base_url(request)}/uploads/{path.name}"
+def create_draft_listing_route(payload: DraftListingRequest) -> dict:
+    # No local file access needed at all — the Supabase object was uploaded back in
+    # /api/identify, and its public URL is fully deterministic from upload_id.
+    storage_config = _call_storage(load_supabase_storage_config)
+    image_url = public_url(storage_config, payload.upload_id)
     result = _call_ebay(
         create_draft_listing,
         payload.identification,
@@ -360,12 +383,6 @@ def create_draft_listing_route(payload: DraftListingRequest, request: Request) -
         payload.weight_lbs,
         payload.currency,
     )
-    # The file is deliberately KEPT here (not deleted) — eBay fetches imageUrls lazily,
-    # not synchronously during createOrReplaceInventoryItem, so deleting it this early
-    # was causing published listings to show "image not available": by the time eBay
-    # actually fetched it (around publish time), the file was already gone. It now only
-    # gets deleted once publish_offer_route() actually succeeds (see below), or the
-    # identify/refine call that produced it failed outright.
     return {"status": "complete", "result": result.model_dump()}
 
 
@@ -380,20 +397,13 @@ class UpdateDraftListingRequest(BaseModel):
 
 
 @app.post("/api/listing/draft/{offer_id}/update")
-def update_draft_listing_route(offer_id: str, payload: UpdateDraftListingRequest, request: Request) -> dict:
+def update_draft_listing_route(offer_id: str, payload: UpdateDraftListingRequest) -> dict:
     """Applies edits made in the review screen (title/brand/condition/description/
     category/price/weight) to the already-created draft, in place — the automatic
     identification and category suggestion can be wrong, and this is the human's chance
     to fix it before publishing."""
-    matches = list(UPLOAD_DIR.glob(f"{payload.upload_id}.*"))
-    if not matches:
-        raise HTTPException(
-            status_code=404,
-            detail="Upload not found — the image may have been removed. Start a new draft instead.",
-        )
-    path = matches[0]
-
-    image_url = f"{_public_base_url(request)}/uploads/{path.name}"
+    storage_config = _call_storage(load_supabase_storage_config)
+    image_url = public_url(storage_config, payload.upload_id)
     result = _call_ebay(
         update_draft_listing,
         offer_id,
@@ -435,9 +445,11 @@ def publish_offer_route(offer_id: str, payload: PublishRequest) -> dict:
     token = _call_ebay(get_valid_access_token, config)
     result = _call_ebay(publish_offer, config, token, offer_id)
     # Only now — once eBay has actually taken the listing live — is it safe to remove
-    # the source image. Deleting it any earlier (as create_draft_listing_route used to)
-    # meant eBay's lazy imageUrls fetch could happen after the file was already gone.
+    # the source image from Supabase Storage. Deleting it any earlier meant eBay's lazy
+    # imageUrls fetch could happen after the object was already gone. Best-effort:
+    # delete_image() logs failures rather than raising, since a lingering Supabase
+    # object is a much smaller problem than surfacing an error after publish succeeded.
     if payload.upload_id:
-        for match in UPLOAD_DIR.glob(f"{payload.upload_id}.*"):
-            match.unlink(missing_ok=True)
+        storage_config = _call_storage(load_supabase_storage_config)
+        delete_image(storage_config, payload.upload_id)
     return {"status": "complete", "result": result.model_dump()}

@@ -95,10 +95,14 @@ def generate_sku(upload_id: str) -> str:
 
 
 def _build_description(identification: ProductIdentification) -> str:
-    # Deliberately just content_description, not condition_notes — the eBay-facing
-    # description describes what the item is/includes; condition/wear commentary has
-    # its own dedicated condition/condition_notes fields and UI instead.
-    return identification.content_description[:4000]
+    # Title first (matches how real eBay listing descriptions are typically written),
+    # then the Claude-written body — a functionality confirmation line where applicable,
+    # followed by brief specifics. Built here rather than by Claude so the title can
+    # never drift from whatever the user actually confirmed/edited. Deliberately excludes
+    # condition_notes — condition/wear commentary has its own dedicated field and UI.
+    body = identification.content_description.strip()
+    full_description = f"{identification.item_name}\n\n{body}" if body else identification.item_name
+    return full_description[:4000]
 
 
 def _build_inventory_item_payload(

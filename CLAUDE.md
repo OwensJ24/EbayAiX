@@ -68,10 +68,17 @@ Only needed once — the ResNet50 weights are then cached under `~/.cache/torch/
 `.env` for the OAuth connect flow to work. `EBAY_RU_NAME` is not a URL — it's the RuName string eBay
 generates for a registered redirect URI. Separately, `EBAY_PROD_APP_ID`/`EBAY_PROD_CERT_ID` (your
 **production** keyset, not sandbox) must be set for `src/ebay/browse.py`'s comp search — see .env.example
-and the Architecture section below for why this specifically needs production credentials. `PUBLIC_BASE_URL`
-is optional — set it explicitly if the app's own request-derived base URL is ever wrong for building the
-publicly-fetchable image URLs eBay needs when creating a draft listing (see the HTTPS scheme note below for
-why this was silently broken until fixed at the `Dockerfile` level).
+and the Architecture section below for why this specifically needs production credentials.
+
+`SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SUPABASE_BUCKET` must be set for image uploads to work at all
+(see `src/storage/supabase_storage.py` in Architecture below) — use the **secret** key (`sb_secret_...`,
+Settings -> API Keys -> Secret keys), Supabase's modern replacement for the legacy service_role key (used the
+same way; legacy service_role keys still work but are slated for deprecation by end of 2026). Not the
+publishable/anon key, since this is a server-side-only integration that needs elevated write access. The
+bucket must be configured as **public** in the Supabase dashboard (Storage -> the bucket -> "Public bucket"
+toggle) or eBay won't be able to fetch images without authentication. This replaces the old
+`PUBLIC_BASE_URL`-based approach
+of serving images from this app's own `/uploads` mount, which no longer exists.
 
 **If a previously-connected eBay account stops seeing business policies/location/category suggestions in
 draft listings**, it's because the OAuth scope was widened after that connection was made
@@ -144,12 +151,18 @@ only claim 'New' if there is clear evidence (tags, packaging, no wear); return `
 rather than guess.
 
 **`content_description` vs. `condition_notes` — deliberately separate, per explicit direction.**
-`content_description` is what actually becomes the eBay listing description (see `_build_description()` in
-`listing.py` below) — it must describe what the item is and what's visible/included (color, accessories,
-ports, packaging contents), and the system prompt explicitly tells Claude not to mention wear, damage, or
-condition there. `condition_notes` stays as condition-rating justification only (and still feeds
-`resolve_aspects()`'s text-matching corpus in `listing.py`) — it's no longer blended into the buyer-facing
-description the way it used to be.
+`content_description` is the *body* of the eBay listing description — `_build_description()` in
+`listing.py` prepends `identification.item_name` as a title line above it (never trusting Claude to
+reproduce the title verbatim; the title is added programmatically so it can never drift from whatever the
+user actually confirmed/edited). Per explicit direction, `content_description` itself is written like a real,
+simple eBay description, not narrative prose: (1) a short functionality-confirmation line when applicable —
+"Tested and working" for a functional/electronic item, or an honest non-functional equivalent (e.g. "Sold for
+parts, not tested") when condition is `"For Parts"` or otherwise non-functional, omitted entirely for items
+where a working/non-working claim doesn't apply (clothing, books, decorative items) — then (2) brief,
+plain-fact specifics: model number, style, size, material, color, included accessories. The system prompt
+explicitly tells Claude not to mention wear, damage, or condition there. `condition_notes` stays as
+condition-rating justification only (and still feeds `resolve_aspects()`'s text-matching corpus in
+`listing.py`) — it's never blended into the buyer-facing description.
 
 **`src/ebay/browse.py`** — no Claude involved at all; a plain, cheap eBay Browse API call.
 `search_comparable_listings(query)` gets an application-level access token via the **Client Credentials**
@@ -181,17 +194,19 @@ for *two* separate Claude vision calls — to push a request past Render's free-
 The observed symptom was a bare 502 in the browser with **zero** matching Render log output: the request died
 mid-flight (Render's own proxy giving up, or an OOM kill) before this app's own logging or error handling ever
 ran, which is a very different (and much less diagnosable) failure mode than this app's normal 4xx/502/503
-JSON error responses. Confirmed via a synthetic 4032x3024 upload through the real `/api/identify` endpoint
-that the saved file is correctly downscaled to 1600x1200 before any processing touches it; a normal-sized
-image passes through with its bytes completely unchanged (no needless re-encoding). Then runs the local
-classifier + `VisionSubagent.preview()` (Phase 1 — cheap name+category guess, see `vision_subagent.py`
-above), followed immediately by `suggest_categories()` (`listing.py`, using the *application-level*
-`browse.py` token, not the user's OAuth one — Taxonomy category suggestions are public data, so this works
-even before the user has connected their own eBay account, same reasoning as `browse.py`'s comp pricing) to
-turn that free-text category guess into a handful of real, valid eBay categories. Returns
-`{status: "preview", upload_id, item_name, category_suggestions}` — always this shape, no
-confidence-based branching anymore (the mandatory confirm step below replaces what used to be a
-conditional "needs_clarification" path for low-confidence guesses only).
+JSON error responses. `/api/identify` normalizes every upload to JPEG unconditionally (not just when downscaling — see
+`_validate_and_normalize_image()`), which keeps every upload's storage object path fully deterministic
+(`{upload_id}.jpg`), and immediately uploads it to **Supabase Storage** (`src/storage/supabase_storage.py`,
+see below) before doing anything else — confirmed via a synthetic 4032x3024 upload through the real endpoint
+that the saved file is correctly downscaled to 1600x1200. Then runs the local classifier +
+`VisionSubagent.preview()` (Phase 1 — cheap name+category guess, see `vision_subagent.py` above), followed
+immediately by `suggest_categories()` (`listing.py`, using the *application-level* `browse.py` token, not the
+user's OAuth one — Taxonomy category suggestions are public data, so this works even before the user has
+connected their own eBay account, same reasoning as `browse.py`'s comp pricing) to turn that free-text
+category guess into a handful of real, valid eBay categories. Returns `{status: "preview", upload_id,
+item_name, category_suggestions}` — always this shape, no confidence-based branching anymore (the mandatory
+confirm step below replaces what used to be a conditional "needs_clarification" path for low-confidence
+guesses only).
 
 **New `POST /api/categories/search`** — same `suggest_categories()` call, for the frontend's re-search box
 when none of the initial suggestions fit different search terms than the LLM's own guess.
@@ -207,14 +222,22 @@ downstream step (`/api/price`, `/api/listing/draft`, the edit-before-publish scr
 `/api/listing/publish/{offer_id}`) is unchanged — they already just consume whatever `ProductIdentification`
 is in the frontend's `currentIdentification`.
 
-**Both `/api/identify` and `/api/identify/confirm` keep the uploaded file on disk** (returning `upload_id` on
-every response) — it stays on disk through the confirm step, draft creation, *and* any edits, and is only
-deleted once `publish_offer_route()` actually succeeds, or the identify/confirm call itself fails. It used to
-be deleted right after draft creation, which was a real bug: eBay fetches `imageUrls` lazily rather than
-synchronously during `createOrReplaceInventoryItem`, so by the time eBay actually fetched the image (around
-publish time), the file was already gone — surfacing as "image not available" on real, live, published
-listings. A user who abandons the flow entirely (never publishes) leaves an orphaned file in
-`data/uploads/`; no cleanup job exists for this (accepted tradeoff, not a bug).
+**Image lifecycle: local disk is now only a short-lived staging area; Supabase Storage is the durable
+store.** The local temp file (`data/uploads/{upload_id}.jpg`) is needed only for local
+classify()/Claude-vision access, and both of those calls are done — successfully or not — by the end of
+`/api/identify/confirm`, which now deletes it unconditionally (a `finally` block, not just on failure) right
+there. This is a deliberate change from the prior design (which kept the local file all the way through
+draft creation and publish): moving the durable copy to Supabase means local uploads no longer accumulate
+indefinitely for abandoned flows — the old "no cleanup job" limitation for `data/uploads/` is gone. Every
+route from that point on (`/api/listing/draft`, `.../update`, `/api/listing/publish/{offer_id}`) needs zero
+local file access at all — `public_url(config, upload_id)` reconstructs the Supabase image URL purely from
+the deterministic `{upload_id}.jpg` naming, no existence check needed, since `upload_image()` already
+succeeded synchronously back in `/api/identify` (if that failed, the flow never got this far). The Supabase
+object itself is only deleted once `publish_offer_route()` actually succeeds — eBay fetches `imageUrls`
+lazily rather than synchronously at inventory-item-creation time, so deleting any earlier was a real,
+previously-hit bug ("image not available" on real, live, published listings). A user who abandons the flow
+before publishing leaves an orphaned Supabase object; no cleanup job exists for this (accepted tradeoff, same
+as before, just moved to different storage).
 
 **Local ResNet50 inference is serialized across requests via `_inference_lock` (a plain `threading.Lock`).**
 Each sync FastAPI route runs in its own thread-pool thread, so without this, multiple images uploaded in
@@ -309,6 +332,25 @@ calls) is a sibling of `APIStatusError` under the base `APIError`, not a subclas
 escaped the original four `except` clauses as an opaque, untraceable 500. The catch-all exists for the same
 reason — any future exception type from a Claude call (e.g. a raw `pydantic.ValidationError`) now gets
 logged with a full traceback and a specific error message instead of vanishing into a generic crash.
+
+**`src/storage/supabase_storage.py`** — hosts uploaded item photos on Supabase Storage instead of serving
+them from this app's own Render instance. Raw `httpx` calls to Supabase's Storage REST API, matching this
+project's eBay integration style (no SDK dependency): `upload_image()` (`POST
+/storage/v1/object/{bucket}/{path}` with `apikey` + `Authorization: Bearer` headers both set to the
+secret key, plus `x-upsert: true` so re-running identify for the same `upload_id` overwrites cleanly
+rather than erroring), `public_url()` (pure string construction from `{SUPABASE_URL}/storage/v1/object/public
+/{bucket}/{upload_id}.jpg` — deterministic, never checks existence), and `delete_image()` (`DELETE
+/storage/v1/object/{bucket}` with a JSON `{"prefixes": [...]}` body — Supabase's batch-delete shape, confirmed
+against Supabase's own API docs rather than assumed; best-effort, logs failures instead of raising, since a
+lingering Supabase object after a successful publish is a much smaller problem than surfacing an error to the
+user at that point). **Why Supabase and not this app's own `/uploads` endpoint** (the prior design, now
+removed along with `PUBLIC_BASE_URL`): Render's free tier spins down after inactivity, but eBay fetches
+`imageUrls` lazily rather than synchronously when a draft is created — so the old design had a real
+reliability gap where eBay's fetch could land while this app's own instance was asleep. Supabase Storage has
+no such sleep state, so the image is reliably fetchable independent of this app's own uptime. The **bucket
+must be manually configured as public** in the Supabase dashboard (Storage -> the bucket -> "Public bucket"
+toggle) — there's no API to set this, and an eBay fetch against a private bucket's URL would just fail with
+an auth error, which would surface as the same "image not available" symptom this change exists to prevent.
 
 **`src/ebay/listing.py`** — creates a draft eBay listing, lets it be edited in place, and separately,
 optionally publishes it. The category/condition/aspects/location/policy resolution logic is shared via
@@ -425,7 +467,9 @@ human-approval step before *creating* a draft, not just before publishing one) i
 project's scope grows to need it.
 
 **Known limitations, accepted rather than solved:**
-- No TTL/cleanup for abandoned uploads in `data/uploads/` (see `app.py` note above).
+- No TTL/cleanup for abandoned uploads left in Supabase Storage (see `app.py`/`supabase_storage.py` notes
+  above) — local `data/uploads/` no longer has this problem, since that file is now deleted right after
+  `/api/identify/confirm` regardless of what happens afterward.
 - Condition validity is now checked dynamically per category (`resolve_condition()`, see above) rather than
   trusting a static mapping, but `_CONDITION_ID_TO_ENUM` only covers the standard 1000-7000 conditionId
   sequence — category groups with additional non-standard IDs (fashion categories' 2990/3010 for "Pre-owned -
