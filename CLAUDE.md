@@ -10,12 +10,14 @@ listing. It's built to showcase Agent Architecture Design, Computer Vision (loca
 and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so code should reflect deliberate,
 enterprise-style patterns rather than the shortest path to a working demo.
 
-So far: local image classification, Claude-based structured identification, a low-cost eBay comparable-
-listings lookup (no LLM involved), eBay draft-listing creation (Inventory Item + Offer), an in-app listing
-preview + explicit publish step, a FastAPI front end chaining all of it with a human clarification step, and
-an eBay OAuth 2.0 connect flow. The Claude-based orchestrator tying these steps together programmatically,
-and a more general HITL approval gate, are still future work (see "Planned architecture") — but the in-app
-review-then-publish flow already built is this project's first real instance of that gate.
+So far: local image classification, a two-phase Claude-based structured identification (a cheap name+category
+guess, confirmed/corrected by a human, then a fuller analysis informed by that confirmation), a low-cost eBay
+comparable-listings lookup (no LLM involved), eBay draft-listing creation (Inventory Item + Offer), an in-app
+listing preview + explicit publish step, a FastAPI front end chaining all of it together, and an eBay OAuth
+2.0 connect flow. The Claude-based orchestrator tying these steps together programmatically, and a more
+general HITL approval gate, are still future work (see "Planned architecture") — but both the mandatory
+identify/confirm step and the in-app review-then-publish flow already built are this project's concrete
+instances of that gate.
 
 **Important finding that shaped the publish flow:** eBay's Seller Hub has no UI at all for reviewing an
 unpublished offer created via the Inventory API — confirmed via multiple independent eBay developer
@@ -67,8 +69,9 @@ Only needed once — the ResNet50 weights are then cached under `~/.cache/torch/
 generates for a registered redirect URI. Separately, `EBAY_PROD_APP_ID`/`EBAY_PROD_CERT_ID` (your
 **production** keyset, not sandbox) must be set for `src/ebay/browse.py`'s comp search — see .env.example
 and the Architecture section below for why this specifically needs production credentials. `PUBLIC_BASE_URL`
-is optional — only needed if the app's own request-derived base URL is ever wrong for building the
-publicly-fetchable image URLs eBay needs when creating a draft listing.
+is optional — set it explicitly if the app's own request-derived base URL is ever wrong for building the
+publicly-fetchable image URLs eBay needs when creating a draft listing (see the HTTPS scheme note below for
+why this was silently broken until fixed at the `Dockerfile` level).
 
 **If a previously-connected eBay account stops seeing business policies/location/category suggestions in
 draft listings**, it's because the OAuth scope was widened after that connection was made
@@ -89,6 +92,17 @@ storage don't fit a stateless serverless model. Key details baked into the Docke
 - **ResNet50 weights are baked in at build time** (`RUN uv run python -c "from src.ml.vision_preprocessor
   import VisionPreprocessor; VisionPreprocessor()"`) so a cold start on Render's free tier (which spins down
   after inactivity) doesn't need a ~100MB download before the server can respond.
+- **uvicorn is started with `--proxy-headers --forwarded-allow-ips='*'`.** Render terminates TLS at its edge
+  and forwards plain HTTP internally, so without trusting `X-Forwarded-Proto`, `request.base_url` (used by
+  `_public_base_url()` in `app.py` to build the `imageUrls` eBay fetches) silently resolves to `http://`
+  instead of `https://` — uvicorn's default trusted-proxy list is only `127.0.0.1`, which doesn't match
+  Render's actual internal proxy IP. This was a real, confirmed bug: eBay's Inventory API requires HTTPS
+  image URLs and silently drops non-HTTPS ones (no error — the listing just publishes with a broken image),
+  which is exactly what was happening. `--forwarded-allow-ips='*'` is safe specifically because this
+  container has no other direct public exposure — the only thing that can reach it is Render's own edge.
+  Confirmed via local repro (`curl -H "X-Forwarded-Proto: https"` against the built image) both before and
+  after adding the flag. If image issues ever recur, setting `PUBLIC_BASE_URL` explicitly sidesteps this
+  proxy-trust question entirely, at the cost of one more env var to keep in sync with the deployed domain.
 - Test locally with `docker build -t agentx-test .` then `docker run -p 8001:8000 --env-file .env agentx-test`.
 
 **eBay's OAuth redirect requires real HTTPS** — it will not redirect to a `localhost` URL no matter how
@@ -104,13 +118,38 @@ ResNet50 (`torchvision.models.ResNet50_Weights.DEFAULT`) once, auto-selects `mps
 `classify(image_path) -> ClassificationResult`. `ClassificationResult`/`Prediction` are dataclasses with
 `to_dict()`/`to_json()` — this is the JSON-serializable "local ML metadata" handed to the Claude layer.
 
-**`src/agents/vision_subagent.py`** — calls the Claude API. `VisionSubagent.identify(image_path,
-local_classification)` base64-encodes the image, sends it to Claude alongside the local classifier's JSON
-output as context, and uses structured outputs (`client.messages.parse(..., output_format=ProductIdentification)`)
-to force a strict schema: item name, brand, model number, category, a constrained condition enum, condition
-notes, distinguishing features, and a confidence level. The system prompt explicitly tells Claude to trust
-its own visual read over the local classifier's guess when they disagree, and to return `null` for
-brand/model number rather than guess.
+**`src/agents/vision_subagent.py`** — calls the Claude API, in two deliberate phases with a mandatory human
+checkpoint between them, per explicit direction: name and category affect everything downstream (comparable-
+listings search, eBay category-specific condition/aspect rules, buyer discoverability), so they're confirmed
+*first* rather than being just another guess the user might fix later.
+
+`VisionSubagent.preview(image_path, local_classification) -> ItemPreview` — a cheap first pass
+(`max_tokens=256`) that returns only `item_name` + a free-text `category` guess, base64-encoding the image
+and using the local classifier's JSON output as context exactly like `identify()` below. This is what
+`POST /api/identify` calls; the result is never used directly for listing creation, only to seed the
+confirm-step UI (see `app.py` below).
+
+`VisionSubagent.identify(image_path, local_classification, confirmed_item_name, confirmed_category) ->
+ProductIdentification` — the fuller analysis, only ever run *after* a human has confirmed/edited the name and
+picked a real eBay category (see `app.py`'s `/api/identify/confirm`). `confirmed_item_name`/`confirmed_category`
+are required params, not an optional override — the system prompt tells Claude to treat them as ground truth
+and analyze everything else (brand, model number, condition, description); after parsing, `identify()`
+defensively overwrites `item_name`/`category` on the result with the confirmed strings rather than trusting
+the model to echo them back exactly. Uses structured outputs
+(`client.messages.parse(..., output_format=ProductIdentification)`) to force a strict schema: item name,
+brand, model number, category, `category_id` (the confirmed real eBay categoryId, set by the caller —
+Claude never produces this), a constrained condition enum, condition notes, a buyer-facing
+`content_description`, distinguishing features, and a confidence level. Be conservative about condition:
+only claim 'New' if there is clear evidence (tags, packaging, no wear); return `null` for brand/model number
+rather than guess.
+
+**`content_description` vs. `condition_notes` — deliberately separate, per explicit direction.**
+`content_description` is what actually becomes the eBay listing description (see `_build_description()` in
+`listing.py` below) — it must describe what the item is and what's visible/included (color, accessories,
+ports, packaging contents), and the system prompt explicitly tells Claude not to mention wear, damage, or
+condition there. `condition_notes` stays as condition-rating justification only (and still feeds
+`resolve_aspects()`'s text-matching corpus in `listing.py`) — it's no longer blended into the buyer-facing
+description the way it used to be.
 
 **`src/ebay/browse.py`** — no Claude involved at all; a plain, cheap eBay Browse API call.
 `search_comparable_listings(query)` gets an application-level access token via the **Client Credentials**
@@ -129,20 +168,42 @@ read-only, public-data search with no side effects, so production credentials he
 that using production for listing creation would.
 
 **`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
-(git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp), runs the local classifier +
-Vision Subagent, and returns the result directly if `identification_confidence` is `"medium"`/`"high"`. If
-it's `"low"`, it instead returns `status: "needs_clarification"` plus an `upload_id` and leaves the file on
-disk. The frontend (`src/web/static/index.html`, vanilla JS) then prompts the user for the item's name and
-posts it to `POST /api/identify/refine`, which re-runs `VisionSubagent.identify(..., user_provided_name=...)`
-with that hint folded into the prompt and always returns a final result (no further clarification loop).
-**Both endpoints now return `upload_id` on every response and keep the file on disk** (this changed —
-they used to delete it once a final result was ready) — the file now stays on disk through draft creation
-*and* any edits, and is only deleted once `publish_offer_route()` actually succeeds, or the identify/refine
-call itself fails. It used to be deleted right after draft creation, which was a real bug: eBay fetches
-`imageUrls` lazily rather than synchronously during `createOrReplaceInventoryItem`, so by the time eBay
-actually fetched the image (around publish time), the file was already gone — surfacing as "image not
-available" on real, live, published listings. A user who abandons the flow entirely (never publishes) leaves
-an orphaned file in `data/uploads/`; no cleanup job exists for this (accepted tradeoff, not a bug).
+(git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp — all formats eBay's Inventory
+API accepts, confirmed against eBay's own docs) after `_validate_image_dimensions()` opens it with Pillow and
+rejects anything under `EBAY_MIN_IMAGE_DIMENSION` (500px) on either side with a clear 400 — eBay's own docs
+say a smaller image "may be blocked" from the listing, silently, which is a worse failure mode (a seemingly
+successful publish with a broken image) than rejecting it up front at upload time. Then runs the local
+classifier + `VisionSubagent.preview()` (Phase 1 — cheap name+category guess, see `vision_subagent.py`
+above), followed immediately by `suggest_categories()` (`listing.py`, using the *application-level*
+`browse.py` token, not the user's OAuth one — Taxonomy category suggestions are public data, so this works
+even before the user has connected their own eBay account, same reasoning as `browse.py`'s comp pricing) to
+turn that free-text category guess into a handful of real, valid eBay categories. Returns
+`{status: "preview", upload_id, item_name, category_suggestions}` — always this shape, no
+confidence-based branching anymore (the mandatory confirm step below replaces what used to be a
+conditional "needs_clarification" path for low-confidence guesses only).
+
+**New `POST /api/categories/search`** — same `suggest_categories()` call, for the frontend's re-search box
+when none of the initial suggestions fit different search terms than the LLM's own guess.
+
+**`POST /api/identify/confirm`** (this used to be `/api/identify/refine`, with a materially different
+contract — renamed since it's no longer "refine a low-confidence guess" but "run the full analysis now that
+name+category are confirmed"). Body: `{upload_id, item_name, category_id, category_name}` — all mandatory,
+never optional. Re-runs the local classifier, then calls `VisionSubagent.identify(path, local_result,
+item_name, category_name)` (Phase 2 — the full analysis, informed by the *confirmed* name/category rather
+than re-guessing them), sets `identification.category_id = category_id` on the result (Claude never produces
+this — it's the real eBay Taxonomy ID the user picked), and returns the final `ProductIdentification`. Every
+downstream step (`/api/price`, `/api/listing/draft`, the edit-before-publish screen,
+`/api/listing/publish/{offer_id}`) is unchanged — they already just consume whatever `ProductIdentification`
+is in the frontend's `currentIdentification`.
+
+**Both `/api/identify` and `/api/identify/confirm` keep the uploaded file on disk** (returning `upload_id` on
+every response) — it stays on disk through the confirm step, draft creation, *and* any edits, and is only
+deleted once `publish_offer_route()` actually succeeds, or the identify/confirm call itself fails. It used to
+be deleted right after draft creation, which was a real bug: eBay fetches `imageUrls` lazily rather than
+synchronously during `createOrReplaceInventoryItem`, so by the time eBay actually fetched the image (around
+publish time), the file was already gone — surfacing as "image not available" on real, live, published
+listings. A user who abandons the flow entirely (never publishes) leaves an orphaned file in
+`data/uploads/`; no cleanup job exists for this (accepted tradeoff, not a bug).
 
 **Local ResNet50 inference is serialized across requests via `_inference_lock` (a plain `threading.Lock`).**
 Each sync FastAPI route runs in its own thread-pool thread, so without this, multiple images uploaded in
@@ -151,7 +212,7 @@ free-tier memory limit, since each PyTorch CPU inference pass is memory-hungry e
 once exceeds it. The lock only wraps `_preprocessor.classify()`, not the (network-bound) Claude call, so
 those still run concurrently. `VisionPreprocessor.__init__` also sets `torch.set_num_threads(1)` on CPU to
 cut per-inference thread/memory overhead further. The frontend adds a client-side guard on top (disables the
-dropzone/refine button while a request is in flight) so this is defense-in-depth, not the only line of
+dropzone/confirm button while a request is in flight) so this is defense-in-depth, not the only line of
 defense — a different client hitting the API directly still can't cause concurrent local inference.
 
 **A second, distinct OOM pattern: crashes reliably on the *second* full identify pass, even with zero
@@ -168,8 +229,8 @@ normal refcounting/GC timing. If OOM crashes persist after this, the free tier's
 insufficient for this stack (PyTorch + ResNet50 + FastAPI + Anthropic/httpx clients) — upgrading Render's
 plan would be the next lever, not further code changes.
 
-Once identification is final, the frontend shows a "Show Comparable Listings" button that posts the
-`ProductIdentification` (FastAPI validates the JSON body directly against that Pydantic model) to
+Once the confirm step (above) returns a final `ProductIdentification`, the frontend automatically posts it
+(FastAPI validates the JSON body directly against that Pydantic model) to
 `POST /api/price`, which calls `search_comparable_listings()` above using a query built by
 `browse.build_query()` (shared with the Taxonomy category lookup in `listing.py`, see below). The average of
 the returned comps pre-fills an editable price field. The user must also enter a package weight (lbs) — a
@@ -233,18 +294,31 @@ eBay account — this used to reach the client as a bare 500 before `_call_ebay(
 optionally publishes it. The category/condition/aspects/location/policy resolution logic is shared via
 `_resolve_listing_data()` (returns a `_ResolvedListingData`) between `create_draft_listing()` and
 `update_draft_listing()`, since both need the exact same steps — only what happens with the result (POST a
-new offer vs. PUT an update to an existing one) differs. Order: `suggest_category_id()` via the Taxonomy API
-(must run *first* — both condition and required-aspect resolution depend on knowing the category) ->
+new offer vs. PUT an update to an existing one) differs. Order: category resolution (see below) ->
 `resolve_condition()` -> `resolve_aspects()` -> `get_merchant_location_key()` via the Location API ->
 `get_listing_policies()` via the Account API (each of the latter two independently swallows failures and
 returns `None`/`{}` rather than raising, since neither is required to create a valid draft, only to
 *publish* one).
 
+**Category resolution prefers an already-confirmed `category_id` over re-guessing.**
+`_resolve_listing_data()` takes an optional `category_id_override` — when given, it skips
+`suggest_category_id()` (the free-text Taxonomy guess) entirely and uses it directly.
+`create_draft_listing()` always passes `identification.category_id` here, since by the time a draft is
+created the user has already confirmed a real category via `/api/identify/confirm` (see `app.py` above).
+`update_draft_listing()` is more nuanced: if the caller passes an explicit `category_query` (the user is
+changing category at the *later* review screen), that's treated as an override-in-progress —
+`category_id_override=None` so it re-suggests from the new text; otherwise it keeps
+`identification.category_id` as before. `suggest_categories()` (used by `/api/identify` and
+`/api/categories/search` in `app.py`) is the multi-result sibling of `suggest_category_id()` — same
+`get_category_suggestions` endpoint, but returns the top N as `CategorySuggestion` (id + full breadcrumb
+name built from `categoryTreeNodeAncestors`, confirmed live to be root-to-leaf-ordered) instead of just the
+first match, so the frontend can offer a dropdown of real, valid eBay categories rather than trusting one
+guess.
+
 `create_draft_listing()`: `_resolve_listing_data()` -> `createOrReplaceInventoryItem` (PUT) ->
 `createOffer` (POST, `format: "FIXED_PRICE"`, omitting `categoryId`/`merchantLocationKey`/`listingPolicies`
 entirely when not found, never sending them as `null`). `update_draft_listing()`: same
-`_resolve_listing_data()` call (optionally driven by a user-edited `category_query` instead of
-`build_query(identification)`) -> `createOrReplaceInventoryItem` again (same SKU — idempotent PUT, updates
+`_resolve_listing_data()` call -> `createOrReplaceInventoryItem` again (same SKU — idempotent PUT, updates
 the existing inventory item in place) -> `update_offer()` (PUT to `/sell/inventory/v1/offer/{offerId}`, same
 `offer_id` — eBay's updateOffer is a full-replacement PUT like createOrReplaceInventoryItem, not a partial
 patch, so the whole payload is rebuilt fresh via the same `_build_offer_payload()` rather than merged with
@@ -336,9 +410,12 @@ project's scope grows to need it.
   trusting a static mapping, but `_CONDITION_ID_TO_ENUM` only covers the standard 1000-7000 conditionId
   sequence — category groups with additional non-standard IDs (fashion categories' 2990/3010 for "Pre-owned -
   Excellent/Fair", observed live but not independently confirmed) fall through to the best-effort guess and
-  a `notes` warning rather than a confirmed match. Category *suggestion* itself (`suggest_category_id()`)
-  is still a single best-effort Taxonomy API guess with no manual override in the UI; eBay's rejection is
-  still surfaced cleanly via `_call_ebay()` when it's wrong, rather than pre-validated further.
+  a `notes` warning rather than a confirmed match. Category itself is no longer a single best-effort guess —
+  the user confirms a real Taxonomy suggestion (or re-searches) up front (see `app.py`'s `/api/identify`
+  above) — but the *later* edit-before-publish screen's category-search-terms field still drives a fresh
+  `suggest_category_id()` free-text guess rather than the same dropdown-of-real-suggestions UX; picking a
+  wrong category there still just surfaces eBay's rejection cleanly via `_call_ebay()` rather than
+  pre-validating.
 - The Business Policies "opt-in" step (Seller Hub only, not API-exposed) and whether eBay's sandbox even
   supports it are both outside this codebase's control — `get_listing_policies()` degrades gracefully either
   way.

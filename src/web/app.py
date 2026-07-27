@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import io
 import logging
 import os
 import threading
@@ -15,16 +16,18 @@ import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
-from src.ebay.browse import build_query, search_comparable_listings
+from src.ebay.browse import build_query, get_application_access_token, load_ebay_browse_config, search_comparable_listings
 from src.ebay.config import load_ebay_config
 from src.ebay.listing import (
     create_draft_listing,
     create_inventory_location,
     get_offer,
     publish_offer,
+    suggest_categories,
     update_draft_listing,
 )
 from src.ebay.token_store import get_valid_access_token
@@ -40,6 +43,10 @@ T = TypeVar("T")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+# eBay's own Inventory API image requirements: below 500px on either dimension, "the
+# listing may be blocked" — silently, not with a clean rejection at listing-creation
+# time, which is exactly the "image not showing up" failure mode this guards against.
+EBAY_MIN_IMAGE_DIMENSION = 500
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 UPLOAD_DIR = _PROJECT_ROOT / "data" / "uploads"
@@ -66,11 +73,6 @@ _vision_subagent = VisionSubagent()
 _inference_lock = threading.Lock()
 
 
-class RefineRequest(BaseModel):
-    upload_id: str
-    item_name: str
-
-
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -90,12 +92,31 @@ def _read_upload_within_limit(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _validate_image_dimensions(contents: bytes) -> None:
+    try:
+        with Image.open(io.BytesIO(contents)) as image:
+            width, height = image.size
+    except UnidentifiedImageError:
+        raise HTTPException(status_code=400, detail="File isn't a readable image.")
+
+    if width < EBAY_MIN_IMAGE_DIMENSION or height < EBAY_MIN_IMAGE_DIMENSION:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Image is {width}x{height}px — eBay requires at least "
+                f"{EBAY_MIN_IMAGE_DIMENSION}x{EBAY_MIN_IMAGE_DIMENSION}px "
+                "(smaller images may be silently blocked from listings). Upload a larger photo."
+            ),
+        )
+
+
 def _save_upload(file: UploadFile) -> Path:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'unknown'}")
 
     contents = _read_upload_within_limit(file, MAX_UPLOAD_BYTES)
+    _validate_image_dimensions(contents)
     upload_id = uuid.uuid4().hex
     path = UPLOAD_DIR / f"{upload_id}{suffix}"
     path.write_bytes(contents)
@@ -121,6 +142,9 @@ def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
 
 @app.post("/api/identify")
 def identify(file: UploadFile = File(...)) -> dict:
+    """Phase 1 of 2: a cheap preview guess (name + category) only — never the full
+    analysis. The user must confirm/edit both via POST /api/identify/confirm before
+    brand/model/condition/description get analyzed at all (see that route below)."""
     path = _save_upload(file)
     try:
         with _inference_lock:
@@ -132,26 +156,55 @@ def identify(file: UploadFile = File(...)) -> dict:
             # (image tensor + inference) while still holding the lock (so it can't race
             # a concurrent classify()) measurably reduces that carryover.
             gc.collect()
-        identification = _call_claude(_vision_subagent.identify, path, local_result)
+        preview = _call_claude(_vision_subagent.preview, path, local_result)
     except Exception:
         path.unlink(missing_ok=True)
         raise
 
-    if identification.identification_confidence == "low":
-        return {
-            "status": "needs_clarification",
-            "upload_id": path.stem,
-            "result": identification.model_dump(),
-        }
+    # Application-level (client-credentials) eBay token, not the user's OAuth one —
+    # category suggestions are public Taxonomy data, so this works even before the user
+    # has connected their own eBay account (same reasoning as browse.py's comp pricing).
+    browse_config = _call_ebay(load_ebay_browse_config)
+    app_token = _call_ebay(get_application_access_token, browse_config)
+    suggestions = _call_ebay(suggest_categories, browse_config, app_token, preview.category)
 
-    # File is kept (not deleted) so a later draft-listing step can reference the
-    # image — it's only cleaned up once a draft is actually created, or if this
-    # request itself fails (see the except block above).
-    return {"status": "complete", "upload_id": path.stem, "result": identification.model_dump()}
+    # File is kept (not deleted) so the confirm step below can reference the image —
+    # it's only cleaned up once a listing is actually published, or if this request
+    # itself fails (see the except block above).
+    return {
+        "status": "preview",
+        "upload_id": path.stem,
+        "item_name": preview.item_name,
+        "category_suggestions": [s.model_dump() for s in suggestions],
+    }
 
 
-@app.post("/api/identify/refine")
-def refine(payload: RefineRequest) -> dict:
+class CategorySearchRequest(BaseModel):
+    query: str
+
+
+@app.post("/api/categories/search")
+def search_categories(payload: CategorySearchRequest) -> dict:
+    """Lets the confirm-item screen re-search when none of the initial category
+    suggestions fit, using different search terms than the LLM's own guess."""
+    browse_config = _call_ebay(load_ebay_browse_config)
+    app_token = _call_ebay(get_application_access_token, browse_config)
+    suggestions = _call_ebay(suggest_categories, browse_config, app_token, payload.query)
+    return {"status": "complete", "result": {"suggestions": [s.model_dump() for s in suggestions]}}
+
+
+class ConfirmItemRequest(BaseModel):
+    upload_id: str
+    item_name: str
+    category_id: str
+    category_name: str
+
+
+@app.post("/api/identify/confirm")
+def confirm_item(payload: ConfirmItemRequest) -> dict:
+    """Phase 2 of 2: the full Claude analysis (brand/model/condition/description),
+    run only after the user has confirmed a real item name + eBay category — those are
+    passed in as ground truth context rather than re-guessed."""
     matches = list(UPLOAD_DIR.glob(f"{payload.upload_id}.*"))
     if not matches:
         raise HTTPException(status_code=404, detail="Upload not found or already processed")
@@ -162,12 +215,13 @@ def refine(payload: RefineRequest) -> dict:
             local_result = _preprocessor.classify(path)
             gc.collect()
         identification = _call_claude(
-            _vision_subagent.identify, path, local_result, user_provided_name=payload.item_name
+            _vision_subagent.identify, path, local_result, payload.item_name, payload.category_name
         )
     except Exception:
         path.unlink(missing_ok=True)
         raise
 
+    identification.category_id = payload.category_id
     return {"status": "complete", "upload_id": path.stem, "result": identification.model_dump()}
 
 

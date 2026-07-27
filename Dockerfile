@@ -22,4 +22,13 @@ RUN uv run python -c "from src.ml.vision_preprocessor import VisionPreprocessor;
 
 EXPOSE 8000
 
-CMD uv run uvicorn src.web.app:app --host 0.0.0.0 --port ${PORT:-8000}
+# --forwarded-allow-ips='*' trusts X-Forwarded-Proto from whatever connects to this
+# container. Safe here specifically because the container has no other direct public
+# exposure — the only thing that can reach it is Render's own edge proxy, which
+# terminates TLS and forwards plain HTTP internally. Without this, uvicorn's default
+# trusted-proxy list (127.0.0.1 only) doesn't match Render's actual internal proxy IP,
+# so request.base_url silently resolves to http:// instead of https:// — which broke
+# eBay image uploads outright, since eBay's Inventory API requires (and silently drops
+# images from) any imageUrls value that isn't HTTPS. Confirmed via a local repro before
+# and after this flag.
+CMD uv run uvicorn src.web.app:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'

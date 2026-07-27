@@ -95,12 +95,10 @@ def generate_sku(upload_id: str) -> str:
 
 
 def _build_description(identification: ProductIdentification) -> str:
-    parts = [identification.condition_notes]
-    if identification.distinguishing_features:
-        parts.append("Notable features:")
-        parts.extend(f"- {f}" for f in identification.distinguishing_features)
-    description = "\n".join(parts)
-    return description[:4000]
+    # Deliberately just content_description, not condition_notes — the eBay-facing
+    # description describes what the item is/includes; condition/wear commentary has
+    # its own dedicated condition/condition_notes fields and UI instead.
+    return identification.content_description[:4000]
 
 
 def _build_inventory_item_payload(
@@ -181,6 +179,47 @@ def suggest_category_id(config: EbayConfig, token: str, query: str) -> str | Non
     except (httpx.HTTPError, KeyError, IndexError) as e:
         logger.info("suggest_category_id degraded: %r", e)
         return None
+
+
+class CategorySuggestion(BaseModel):
+    category_id: str
+    category_name: str
+
+
+def _breadcrumb(suggestion: dict) -> str:
+    ancestors = suggestion.get("categoryTreeNodeAncestors", [])
+    # eBay returns ancestors nearest-parent-first; reverse for a root-to-leaf breadcrumb.
+    names = [a["categoryName"] for a in reversed(ancestors)]
+    names.append(suggestion["category"]["categoryName"])
+    return " > ".join(names)
+
+
+def suggest_categories(config: EbayConfig, token: str, query: str, limit: int = 5) -> list[CategorySuggestion]:
+    """Like suggest_category_id(), but returns the top `limit` ranked suggestions with
+    full breadcrumb names instead of just the first categoryId — used so the user can
+    pick from a dropdown of real, valid eBay categories rather than trusting a single
+    auto-guess or typing free text. Degrades to an empty list on any failure, same as
+    suggest_category_id()'s None.
+    """
+    try:
+        response = httpx.get(
+            f"{config.api_base}/commerce/taxonomy/v1/category_tree/{_CATEGORY_TREE_ID}/get_category_suggestions",
+            headers=_auth_headers(token),
+            params={"q": query},
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        suggestions = response.json().get("categorySuggestions", [])
+        return [
+            CategorySuggestion(category_id=s["category"]["categoryId"], category_name=_breadcrumb(s))
+            for s in suggestions[:limit]
+        ]
+    except httpx.HTTPStatusError as e:
+        logger.info("suggest_categories degraded: %d %s", e.response.status_code, e.response.text[:300])
+        return []
+    except (httpx.HTTPError, KeyError, IndexError) as e:
+        logger.info("suggest_categories degraded: %r", e)
+        return []
 
 
 def resolve_condition(
@@ -294,7 +333,12 @@ def resolve_aspects(
     unresolved list.
     """
     corpus = " ".join(
-        [identification.item_name, identification.condition_notes, *identification.distinguishing_features]
+        [
+            identification.item_name,
+            identification.condition_notes,
+            identification.content_description,
+            *identification.distinguishing_features,
+        ]
     ).lower()
 
     aspects: dict[str, list[str]] = {}
@@ -564,13 +608,21 @@ class _ResolvedListingData(BaseModel):
 
 
 def _resolve_listing_data(
-    config: EbayConfig, token: str, identification: ProductIdentification, query: str
+    config: EbayConfig,
+    token: str,
+    identification: ProductIdentification,
+    query: str,
+    category_id_override: str | None = None,
 ) -> _ResolvedListingData:
     """Shared by create_draft_listing() and update_draft_listing(): resolves
     category/condition/aspects/location/policies from `identification` and the given
     category search query. Raises RuntimeError for a genuinely unresolvable required
     aspect (see resolve_aspects) — fails fast rather than letting a guaranteed eBay
     rejection happen downstream.
+
+    `category_id_override`, when given, skips the Taxonomy suggestion call entirely —
+    used when the user already confirmed a real category via the identify/confirm step
+    (or hasn't changed it in the later edit screen), so there's no need to re-guess.
     """
     included: list[str] = []
     missing: list[str] = []
@@ -580,12 +632,16 @@ def _resolve_listing_data(
     # condition/aspects have to already be ones this category allows — eBay validates
     # condition-vs-category and required-aspects downstream and rejects mismatches with
     # cryptic errors (25021, 25002), so resolving this first minimizes those round-trips.
-    category_id = suggest_category_id(config, token, query)
-    if category_id:
+    if category_id_override:
+        category_id = category_id_override
         included.append("category")
     else:
-        missing.append("category")
-        notes.append("No eBay category suggestion found — try more specific category search terms.")
+        category_id = suggest_category_id(config, token, query)
+        if category_id:
+            included.append("category")
+        else:
+            missing.append("category")
+            notes.append("No eBay category suggestion found — try more specific category search terms.")
 
     condition_enum, condition_confirmed = resolve_condition(config, token, category_id, identification.condition)
     if category_id and not condition_confirmed:
@@ -660,7 +716,10 @@ def create_draft_listing(
     sku = generate_sku(upload_id)
 
     query = build_query(identification)
-    data = _resolve_listing_data(config, token, identification, query)
+    # By this point the user has already confirmed a real eBay category via the
+    # identify/confirm step — identification.category_id carries it, so this skips
+    # re-guessing from free text (falls back to it only if somehow unset).
+    data = _resolve_listing_data(config, token, identification, query, category_id_override=identification.category_id)
 
     create_or_replace_inventory_item(
         config, token, sku, identification, image_url, data.condition_enum, data.aspects, weight_lbs, quantity
@@ -703,8 +762,16 @@ def update_draft_listing(
     config = load_ebay_config()
     token = get_valid_access_token(config)
 
-    query = category_query or build_query(identification)
-    data = _resolve_listing_data(config, token, identification, query)
+    # An explicit category_query here means the user is changing category at this later
+    # review stage — honor that by re-suggesting from the new text rather than keeping the
+    # already-confirmed category_id. Otherwise keep what was already confirmed.
+    if category_query:
+        query = category_query
+        category_id_override = None
+    else:
+        query = build_query(identification)
+        category_id_override = identification.category_id
+    data = _resolve_listing_data(config, token, identification, query, category_id_override=category_id_override)
 
     create_or_replace_inventory_item(
         config, token, sku, identification, image_url, data.condition_enum, data.aspects, weight_lbs, quantity

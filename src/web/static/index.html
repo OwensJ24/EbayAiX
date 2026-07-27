@@ -61,10 +61,20 @@
 
   <img id="preview" alt="preview">
   <div id="status"></div>
-  <div id="clarification" style="display:none;">
-    <p><strong>Not confident on this one.</strong> What is the name of this item?</p>
-    <input type="text" id="itemNameInput" placeholder="e.g. Sony WH-1000XM4 headphones">
-    <button id="submitClarification">Continue</button>
+  <div id="confirmSection" style="display:none;">
+    <p><strong>Confirm what this item is before analysis</strong> — the rest of the
+    analysis (brand, model, condition, description) is based on what you confirm here,
+    so fix anything wrong before continuing.</p>
+    <label for="confirmItemNameInput">Item name</label>
+    <input type="text" id="confirmItemNameInput">
+    <label for="categorySelect">eBay category</label>
+    <select id="categorySelect"></select>
+    <label for="categorySearchInput">Search different category terms</label>
+    <input type="text" id="categorySearchInput" placeholder="e.g. bluetooth over-ear headphones">
+    <button id="categorySearchButton">Search</button>
+    <div id="categorySearchStatus"></div>
+    <button id="confirmItemButton">Confirm &amp; Analyze</button>
+    <div id="confirmStatus"></div>
   </div>
   <div id="priceStatus"></div>
 
@@ -125,9 +135,14 @@
     const fileInput = document.getElementById('fileInput');
     const preview = document.getElementById('preview');
     const statusEl = document.getElementById('status');
-    const clarificationEl = document.getElementById('clarification');
-    const itemNameInput = document.getElementById('itemNameInput');
-    const submitClarificationBtn = document.getElementById('submitClarification');
+    const confirmSection = document.getElementById('confirmSection');
+    const confirmItemNameInput = document.getElementById('confirmItemNameInput');
+    const categorySelect = document.getElementById('categorySelect');
+    const categorySearchInput = document.getElementById('categorySearchInput');
+    const categorySearchButton = document.getElementById('categorySearchButton');
+    const categorySearchStatusEl = document.getElementById('categorySearchStatus');
+    const confirmItemButton = document.getElementById('confirmItemButton');
+    const confirmStatusEl = document.getElementById('confirmStatus');
     const priceStatusEl = document.getElementById('priceStatus');
     const draftSection = document.getElementById('draftSection');
     const priceInput = document.getElementById('priceInput');
@@ -240,7 +255,10 @@
       // an out-of-memory error on Render's constrained free tier.
       if (isUploading) return;
 
-      clarificationEl.style.display = 'none';
+      confirmSection.style.display = 'none';
+      confirmStatusEl.innerHTML = '';
+      categorySearchStatusEl.innerHTML = '';
+      categorySearchInput.value = '';
       priceStatusEl.innerHTML = '';
       draftSection.style.display = 'none';
       draftStatusEl.innerHTML = '';
@@ -275,7 +293,7 @@
           if (!res.ok) throw new Error(data.detail || 'Request failed');
           return data;
         })
-        .then(handleResponse)
+        .then(showConfirmStep)
         .catch((err) => {
           statusEl.innerHTML = `<p class="error">${err.message}</p>`;
         })
@@ -285,21 +303,112 @@
         });
     }
 
-    function handleResponse(data) {
-      currentUploadId = data.upload_id;
-      if (data.status === 'needs_clarification') {
-        currentIdentification = null;
-        draftSection.style.display = 'none';
-        priceStatusEl.innerHTML = '';
-        statusEl.innerHTML = `<p>Best guess so far:</p><pre>${JSON.stringify(data.result, null, 2)}</pre>`;
-        clarificationEl.style.display = 'block';
-      } else {
-        clarificationEl.style.display = 'none';
-        currentIdentification = data.result;
-        statusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
-        fetchComparableListings();
+    function populateCategorySelect(suggestions) {
+      categorySelect.innerHTML = '';
+      if (!suggestions || !suggestions.length) {
+        const opt = document.createElement('option');
+        opt.textContent = 'No categories found — search different terms below';
+        opt.disabled = true;
+        opt.selected = true;
+        categorySelect.appendChild(opt);
+        confirmItemButton.disabled = true;
+        return;
       }
+      suggestions.forEach((s) => {
+        const opt = document.createElement('option');
+        opt.value = s.category_id;
+        opt.textContent = s.category_name;
+        categorySelect.appendChild(opt);
+      });
+      confirmItemButton.disabled = false;
     }
+
+    function showConfirmStep(data) {
+      currentUploadId = data.upload_id;
+      currentIdentification = null;
+      statusEl.innerHTML = '';
+      confirmItemNameInput.value = data.item_name;
+      populateCategorySelect(data.category_suggestions);
+      confirmSection.style.display = 'block';
+    }
+
+    categorySearchButton.addEventListener('click', () => {
+      const query = categorySearchInput.value.trim();
+      if (!query) return;
+
+      categorySearchButton.disabled = true;
+      categorySearchStatusEl.textContent = 'Searching eBay categories…';
+
+      fetch('/api/categories/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then((data) => {
+          populateCategorySelect(data.result.suggestions);
+          categorySearchStatusEl.innerHTML = data.result.suggestions.length
+            ? ''
+            : '<p class="error">No categories found for that search.</p>';
+        })
+        .catch((err) => {
+          categorySearchStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          categorySearchButton.disabled = false;
+        });
+    });
+
+    confirmItemButton.addEventListener('click', () => {
+      const itemName = confirmItemNameInput.value.trim();
+      const categoryId = categorySelect.value;
+      const categoryName = categorySelect.options[categorySelect.selectedIndex]
+        ? categorySelect.options[categorySelect.selectedIndex].textContent
+        : '';
+      if (!itemName) {
+        confirmStatusEl.innerHTML = '<p class="error">Item name cannot be empty.</p>';
+        return;
+      }
+      if (!categoryId) {
+        confirmStatusEl.innerHTML = '<p class="error">Pick a category first.</p>';
+        return;
+      }
+
+      confirmItemButton.disabled = true;
+      confirmStatusEl.textContent = 'Analyzing item…';
+
+      fetch('/api/identify/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          upload_id: currentUploadId,
+          item_name: itemName,
+          category_id: categoryId,
+          category_name: categoryName,
+        }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Request failed');
+          return data;
+        })
+        .then((data) => {
+          confirmSection.style.display = 'none';
+          currentIdentification = data.result;
+          statusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
+          fetchComparableListings();
+        })
+        .catch((err) => {
+          confirmStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        })
+        .finally(() => {
+          confirmItemButton.disabled = false;
+        });
+    });
 
     function fetchComparableListings() {
       if (!currentIdentification) return;
@@ -383,13 +492,7 @@
       editBrand.value = identification.brand || '';
       editCondition.value = identification.condition;
       editCategoryQuery.value = categoryQuery || '';
-
-      const descriptionLines = [identification.condition_notes];
-      if (identification.distinguishing_features && identification.distinguishing_features.length) {
-        descriptionLines.push('Notable features:');
-        identification.distinguishing_features.forEach((f) => descriptionLines.push(`- ${f}`));
-      }
-      editDescription.value = descriptionLines.join('\n');
+      editDescription.value = identification.content_description;
     }
 
     // Refreshes the read-only bits driven by the latest DraftListingResult — aspects,
@@ -446,16 +549,12 @@
         return;
       }
 
-      // The edited description becomes the single source of truth for condition_notes;
-      // distinguishing_features is cleared so the description isn't reconstructed with
-      // duplicated content on a later edit.
       const updatedIdentification = {
         ...currentIdentification,
         item_name: title,
         brand: editBrand.value.trim() || null,
         condition: editCondition.value,
-        condition_notes: editDescription.value,
-        distinguishing_features: [],
+        content_description: editDescription.value,
       };
 
       saveChangesButton.disabled = true;
@@ -543,35 +642,6 @@
         });
     });
 
-    submitClarificationBtn.addEventListener('click', () => {
-      if (isUploading) return;
-      const itemName = itemNameInput.value.trim();
-      if (!itemName || !currentUploadId) return;
-
-      isUploading = true;
-      submitClarificationBtn.disabled = true;
-      statusEl.textContent = 'Refining…';
-      clarificationEl.style.display = 'none';
-
-      fetch('/api/identify/refine', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ upload_id: currentUploadId, item_name: itemName }),
-      })
-        .then(async (res) => {
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || 'Request failed');
-          return data;
-        })
-        .then(handleResponse)
-        .catch((err) => {
-          statusEl.innerHTML = `<p class="error">${err.message}</p>`;
-        })
-        .finally(() => {
-          isUploading = false;
-          submitClarificationBtn.disabled = false;
-        });
-    });
   </script>
 </body>
 </html>

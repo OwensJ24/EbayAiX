@@ -24,15 +24,32 @@ _MEDIA_TYPES = {
     ".gif": "image/gif",
 }
 
+_PREVIEW_SYSTEM_PROMPT = (
+    "You are a product identification specialist for an e-commerce reselling pipeline. "
+    "Examine the item photo and give a quick best guess at what it is and what eBay "
+    "category it belongs to — this is a fast first pass; a human will confirm or correct "
+    "these before a second, more detailed analysis. A local ResNet50 classifier has "
+    "already produced a baseline category guess, provided as context below — treat it as "
+    "a hint, and trust your own visual analysis over it if they disagree."
+)
+
 _SYSTEM_PROMPT = (
     "You are a product identification specialist for an e-commerce reselling pipeline. "
-    "Examine the item photo and extract structured details for a resale listing. "
-    "A local ResNet50 classifier has already produced a baseline category guess, provided "
-    "as context below — treat it as a hint, and trust your own visual analysis over it "
-    "if they disagree. Be conservative about condition: only claim 'New' if there is clear "
-    "evidence (tags, packaging, no wear). If you cannot read a model number or brand, leave "
-    "it null rather than guessing."
+    "The item's name and eBay category have already been confirmed by a human — treat "
+    "them as ground truth, do not second-guess or change them. Your job now is to fill in "
+    "everything else: brand, model number, condition, and a description. Be conservative "
+    "about condition: only claim 'New' if there is clear evidence (tags, packaging, no "
+    "wear). If you cannot read a model number or brand, leave it null rather than "
+    "guessing. For content_description, describe what the item is and what's visible or "
+    "included (color, accessories, ports, packaging contents) as a buyer-facing "
+    "paragraph — do NOT mention wear, damage, defects, or condition there; that belongs "
+    "only in condition_notes."
 )
+
+
+class ItemPreview(BaseModel):
+    item_name: str = Field(description="Clean, human-readable product title suitable for a listing")
+    category: str = Field(description="Specific product category guess, e.g. 'Digital SLR Camera'")
 
 
 class ProductIdentification(BaseModel):
@@ -40,8 +57,12 @@ class ProductIdentification(BaseModel):
     brand: str | None = Field(default=None, description="Manufacturer or brand name, if identifiable")
     model_number: str | None = Field(default=None, description="Model number or SKU visible on the item, if any")
     category: str = Field(description="Specific product category, e.g. 'Digital SLR Camera'")
+    category_id: str | None = Field(default=None, description="Confirmed eBay Taxonomy categoryId, set after user confirmation")
     condition: Literal["New", "Like New", "Very Good", "Good", "Acceptable", "For Parts"]
     condition_notes: str = Field(description="Specific visible wear, damage, or missing parts supporting the condition rating")
+    content_description: str = Field(
+        description="Buyer-facing paragraph describing what the item is and what's visible/included — no condition or wear commentary"
+    )
     distinguishing_features: list[str] = Field(
         description="Visible features useful for identifying the exact variant: color, ports, markings, included accessories"
     )
@@ -49,7 +70,9 @@ class ProductIdentification(BaseModel):
 
 
 class VisionSubagent:
-    """Wraps a Claude vision call that extracts strict structured product data."""
+    """Wraps Claude vision calls that extract structured product data, in two phases:
+    a cheap preview() guess, and a fuller identify() analysis run only after a human
+    confirms the preview's name/category."""
 
     def __init__(self, model: str = "claude-sonnet-5") -> None:
         self.model = model
@@ -61,23 +84,42 @@ class VisionSubagent:
         data = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
         return data, media_type
 
+    def preview(self, image_path: str | Path, local_classification: ClassificationResult) -> ItemPreview:
+        image_data, media_type = self._encode_image(image_path)
+        local_context = json.dumps(local_classification.to_dict(), indent=2)
+        prompt_text = f"Local ResNet50 classifier output:\n{local_context}\n\nWhat is this item, and what eBay category does it belong to?"
+
+        response = self.client.messages.parse(
+            model=self.model,
+            max_tokens=256,
+            system=_PREVIEW_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }],
+            output_format=ItemPreview,
+        )
+        return response.parsed_output
+
     def identify(
         self,
         image_path: str | Path,
         local_classification: ClassificationResult,
-        user_provided_name: str | None = None,
+        confirmed_item_name: str,
+        confirmed_category: str,
     ) -> ProductIdentification:
         image_data, media_type = self._encode_image(image_path)
         local_context = json.dumps(local_classification.to_dict(), indent=2)
 
-        prompt_text = f"Local ResNet50 classifier output:\n{local_context}\n\n"
-        if user_provided_name:
-            prompt_text += (
-                f'The user has confirmed this item is: "{user_provided_name}". '
-                "Use this to identify the specific brand, model number, and category as "
-                "precisely as possible.\n\n"
-            )
-        prompt_text += "Identify this item."
+        prompt_text = (
+            f"Local ResNet50 classifier output:\n{local_context}\n\n"
+            f'The user has confirmed this item is: "{confirmed_item_name}", '
+            f'in eBay category: "{confirmed_category}". '
+            "Analyze the photo for everything else: brand, model number, condition, and description."
+        )
 
         response = self.client.messages.parse(
             model=self.model,
@@ -92,7 +134,11 @@ class VisionSubagent:
             }],
             output_format=ProductIdentification,
         )
-        return response.parsed_output
+        identification = response.parsed_output
+        # Defensive — don't trust the model to echo the confirmed values back exactly.
+        identification.item_name = confirmed_item_name
+        identification.category = confirmed_category
+        return identification
 
 
 def main() -> None:
@@ -102,7 +148,15 @@ def main() -> None:
     args = parser.parse_args()
 
     local_result = VisionPreprocessor().classify(args.image_path)
-    identification = VisionSubagent(model=args.model).identify(args.image_path, local_result)
+    subagent = VisionSubagent(model=args.model)
+
+    # No human in the loop for this standalone CLI — chain preview straight into
+    # identify() using its own guesses as "confirmed", unlike the web app's flow where a
+    # user reviews/edits them in between.
+    preview = subagent.preview(args.image_path, local_result)
+    print("Preview:", preview.model_dump_json(indent=2))
+
+    identification = subagent.identify(args.image_path, local_result, preview.item_name, preview.category)
     print(identification.model_dump_json(indent=2))
 
 
