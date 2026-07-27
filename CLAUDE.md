@@ -290,6 +290,15 @@ development; `_call_ebay()` additionally catches the `RuntimeError` that `load_e
 `load_ebay_browse_config()`/`get_valid_access_token()` raise for missing env vars or a not-yet-connected
 eBay account — this used to reach the client as a bare 500 before `_call_ebay()` existed.
 
+**`_call_claude()` also catches `anthropic.APIResponseValidationError` explicitly, plus a catch-all
+`Exception` fallback, both logged via `logger.exception()`.** Found by inspecting the `anthropic` package's
+exception hierarchy directly: `APIResponseValidationError` (raised when Claude's response fails to validate
+against the requested structured-output schema — a real, if uncommon, failure mode for `output_format=...`
+calls) is a sibling of `APIStatusError` under the base `APIError`, not a subclass of it, so it silently
+escaped the original four `except` clauses as an opaque, untraceable 500. The catch-all exists for the same
+reason — any future exception type from a Claude call (e.g. a raw `pydantic.ValidationError`) now gets
+logged with a full traceback and a specific error message instead of vanishing into a generic crash.
+
 **`src/ebay/listing.py`** — creates a draft eBay listing, lets it be edited in place, and separately,
 optionally publishes it. The category/condition/aspects/location/policy resolution logic is shared via
 `_resolve_listing_data()` (returns a `_ResolvedListingData`) between `create_draft_listing()` and

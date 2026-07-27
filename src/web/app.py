@@ -136,8 +136,25 @@ def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
         raise HTTPException(status_code=503, detail="Rate limit reached. Please try again shortly.")
     except anthropic.APIConnectionError:
         raise HTTPException(status_code=503, detail="Could not reach Claude's API. Check your network connection.")
+    except anthropic.APIResponseValidationError as e:
+        # Raised when Claude's response doesn't validate against the requested
+        # structured-output schema (output_format=...) — a real, if uncommon, failure
+        # mode distinct from APIStatusError (this is APIError's other direct subclass,
+        # so it wasn't caught by the clause below until this was added). Logged with
+        # full detail since this is otherwise a silent, untraceable failure.
+        logger.exception("Claude structured-output response failed schema validation")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Claude returned a response that didn't match the expected format ({e}). Please try again.",
+        )
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Claude API error: {e.message}")
+    except Exception as e:
+        # Last-resort net: any other exception from a Claude call (e.g. a raw
+        # pydantic.ValidationError) used to propagate as an opaque, untraceable 500.
+        # Logging it here means the next occurrence is actually diagnosable via logs.
+        logger.exception("Unexpected error during a Claude-backed call")
+        raise HTTPException(status_code=502, detail=f"Unexpected error calling Claude: {type(e).__name__}: {e}")
 
 
 @app.post("/api/identify")
