@@ -47,6 +47,16 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 # listing may be blocked" — silently, not with a clean rejection at listing-creation
 # time, which is exactly the "image not showing up" failure mode this guards against.
 EBAY_MIN_IMAGE_DIMENSION = 500
+# eBay's own docs say "preferably at least 1600 by 1600 pixels" — not a hard minimum,
+# just a quality preference — so downscaling anything larger than this to 1600px on its
+# longest side stays within eBay's own guidance while capping how much raw pixel data
+# gets processed by local ResNet50 inference (twice — once each in the preview/confirm
+# phases) and base64-encoded for each Claude vision call. Full-resolution modern phone
+# photos (4000px+) were plausibly large enough to push Render's free-tier request past
+# its timeout or memory limit with zero application-level logging — the request dies
+# mid-flight (a 502 from Render's own proxy, not one of this app's own error responses)
+# before any of our own logging or error handling ever runs.
+EBAY_MAX_IMAGE_DIMENSION = 1600
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 UPLOAD_DIR = _PROJECT_ROOT / "data" / "uploads"
@@ -92,13 +102,14 @@ def _read_upload_within_limit(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _validate_image_dimensions(contents: bytes) -> None:
+def _validate_and_normalize_image(contents: bytes, suffix: str) -> tuple[bytes, str]:
     try:
-        with Image.open(io.BytesIO(contents)) as image:
-            width, height = image.size
+        image = Image.open(io.BytesIO(contents))
+        image.load()
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="File isn't a readable image.")
 
+    width, height = image.size
     if width < EBAY_MIN_IMAGE_DIMENSION or height < EBAY_MIN_IMAGE_DIMENSION:
         raise HTTPException(
             status_code=400,
@@ -109,6 +120,19 @@ def _validate_image_dimensions(contents: bytes) -> None:
             ),
         )
 
+    if max(width, height) <= EBAY_MAX_IMAGE_DIMENSION:
+        return contents, suffix
+
+    # Always re-encode as JPEG when downscaling, regardless of original format —
+    # simplest way to keep the saved bytes, file extension, and served content-type all
+    # consistent after a resize (a .webp/.png extension paired with re-encoded JPEG
+    # bytes would otherwise mismatch what StaticFiles reports as Content-Type).
+    image = image.convert("RGB")
+    image.thumbnail((EBAY_MAX_IMAGE_DIMENSION, EBAY_MAX_IMAGE_DIMENSION), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=88)
+    return buf.getvalue(), ".jpg"
+
 
 def _save_upload(file: UploadFile) -> Path:
     suffix = Path(file.filename or "").suffix.lower()
@@ -116,7 +140,7 @@ def _save_upload(file: UploadFile) -> Path:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'unknown'}")
 
     contents = _read_upload_within_limit(file, MAX_UPLOAD_BYTES)
-    _validate_image_dimensions(contents)
+    contents, suffix = _validate_and_normalize_image(contents, suffix)
     upload_id = uuid.uuid4().hex
     path = UPLOAD_DIR / f"{upload_id}{suffix}"
     path.write_bytes(contents)

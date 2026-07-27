@@ -169,10 +169,21 @@ that using production for listing creation would.
 
 **`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
 (git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp — all formats eBay's Inventory
-API accepts, confirmed against eBay's own docs) after `_validate_image_dimensions()` opens it with Pillow and
+API accepts, confirmed against eBay's own docs) after `_validate_and_normalize_image()` opens it with Pillow,
 rejects anything under `EBAY_MIN_IMAGE_DIMENSION` (500px) on either side with a clear 400 — eBay's own docs
 say a smaller image "may be blocked" from the listing, silently, which is a worse failure mode (a seemingly
-successful publish with a broken image) than rejecting it up front at upload time. Then runs the local
+successful publish with a broken image) than rejecting it up front at upload time — and **downscales anything
+over `EBAY_MAX_IMAGE_DIMENSION` (1600px, matching eBay's own "preferably at least 1600x1600" guidance) to
+1600px on its longest side, always re-encoding as JPEG (`.jpg`) regardless of original format when it does.**
+This exists because full-resolution modern phone photos (4000px+, several MB) were plausibly large enough —
+run through local ResNet50 inference *twice* (once each in the preview and confirm phases) and base64-encoded
+for *two* separate Claude vision calls — to push a request past Render's free-tier timeout or memory limit.
+The observed symptom was a bare 502 in the browser with **zero** matching Render log output: the request died
+mid-flight (Render's own proxy giving up, or an OOM kill) before this app's own logging or error handling ever
+ran, which is a very different (and much less diagnosable) failure mode than this app's normal 4xx/502/503
+JSON error responses. Confirmed via a synthetic 4032x3024 upload through the real `/api/identify` endpoint
+that the saved file is correctly downscaled to 1600x1200 before any processing touches it; a normal-sized
+image passes through with its bytes completely unchanged (no needless re-encoding). Then runs the local
 classifier + `VisionSubagent.preview()` (Phase 1 — cheap name+category guess, see `vision_subagent.py`
 above), followed immediately by `suggest_categories()` (`listing.py`, using the *application-level*
 `browse.py` token, not the user's OAuth one — Taxonomy category suggestions are public data, so this works
