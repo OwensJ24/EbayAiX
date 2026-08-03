@@ -1,18 +1,16 @@
-"""Claude-based Vision Subagent: structured product identification from an image."""
+"""Claude-based Vision Subagent: structured product identification from one or more
+photos of the same item."""
 
 from __future__ import annotations
 
 import argparse
 import base64
-import json
 from pathlib import Path
 from typing import Literal
 
 import anthropic
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
-from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 
 load_dotenv()
 
@@ -24,13 +22,16 @@ _MEDIA_TYPES = {
     ".gif": "image/gif",
 }
 
+_MULTI_IMAGE_NOTE = (
+    "You may be given multiple photos of the same item — examine all of them together; "
+    "a detail visible in one (e.g. a tag, label, or box) may not be visible in another."
+)
+
 _PREVIEW_SYSTEM_PROMPT = (
     "You are a product identification specialist for an e-commerce reselling pipeline. "
-    "Examine the item photo and give a quick best guess at what it is and what eBay "
+    "Examine the item photo(s) and give a quick best guess at what it is and what eBay "
     "category it belongs to — this is a fast first pass; a human will confirm or correct "
-    "these before a second, more detailed analysis. A local ResNet50 classifier has "
-    "already produced a baseline category guess, provided as context below — treat it as "
-    "a hint, and trust your own visual analysis over it if they disagree."
+    f"these before a second, more detailed analysis. {_MULTI_IMAGE_NOTE}"
 )
 
 _SYSTEM_PROMPT = (
@@ -39,8 +40,8 @@ _SYSTEM_PROMPT = (
     "them as ground truth, do not second-guess or change them. Your job now is to fill in "
     "everything else: brand, model number, condition, and a description. Be conservative "
     "about condition: only claim 'New' if there is clear evidence (tags, packaging, no "
-    "wear). If you cannot read a model number or brand, leave it null rather than "
-    "guessing.\n\n"
+    f"wear). If you cannot read a model number or brand, leave it null rather than "
+    f"guessing. {_MULTI_IMAGE_NOTE}\n\n"
     "For content_description, write it like a real, simple eBay listing description — "
     "not a narrative about what the item is. The title is added separately and already "
     "covers that; do not repeat it. Structure: (1) If this is a functional/electronic "
@@ -51,7 +52,12 @@ _SYSTEM_PROMPT = (
     "clothing, books, purely decorative items). (2) List relevant specifics as short, "
     "plain facts — model number, style, size, material, color, included accessories — "
     "whatever applies. Keep it brief and factual, not descriptive prose. Do NOT mention "
-    "wear, damage, defects, or condition here; that belongs only in condition_notes."
+    "wear, damage, defects, or condition here; that belongs only in condition_notes.\n\n"
+    "For distinguishing_features, be thorough: this is what downstream eBay category "
+    "item-specifics resolution draws from, so note every visible detail that could match "
+    "one of eBay's required specifics for this category (size, color, material, style, "
+    "type, connectivity, etc.) — check tags, labels, and packaging across all provided "
+    "photos, not just the main shot."
 )
 
 
@@ -84,68 +90,74 @@ class ProductIdentification(BaseModel):
 
 
 class VisionSubagent:
-    """Wraps Claude vision calls that extract structured product data, in two phases:
-    a cheap preview() guess, and a fuller identify() analysis run only after a human
-    confirms the preview's name/category."""
+    """Wraps Claude vision calls that extract structured product data from one or more
+    photos, in two phases: a cheap preview() guess, and a fuller identify() analysis run
+    only after a human confirms the preview's name/category."""
 
     def __init__(self, model: str = "claude-sonnet-5") -> None:
         self.model = model
         self.client = anthropic.Anthropic()
 
-    def _encode_image(self, image_path: str | Path) -> tuple[str, str]:
-        path = Path(image_path)
-        media_type = _MEDIA_TYPES.get(path.suffix.lower(), "image/jpeg")
-        data = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
-        return data, media_type
+    def _image_blocks(self, images: list[tuple[bytes, str]]) -> list[dict]:
+        return [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
+                },
+            }
+            for image_bytes, media_type in images
+        ]
 
-    def preview(self, image_path: str | Path, local_classification: ClassificationResult) -> ItemPreview:
-        image_data, media_type = self._encode_image(image_path)
-        local_context = json.dumps(local_classification.to_dict(), indent=2)
-        prompt_text = f"Local ResNet50 classifier output:\n{local_context}\n\nWhat is this item, and what eBay category does it belong to?"
+    def preview(self, images: list[tuple[bytes, str]]) -> ItemPreview:
+        content = self._image_blocks(images)
+        content.append({"type": "text", "text": "What is this item, and what eBay category does it belong to?"})
 
         response = self.client.messages.parse(
             model=self.model,
             max_tokens=256,
             system=_PREVIEW_SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }],
+            messages=[{"role": "user", "content": content}],
             output_format=ItemPreview,
         )
         return response.parsed_output
 
     def identify(
         self,
-        image_path: str | Path,
-        local_classification: ClassificationResult,
+        images: list[tuple[bytes, str]],
         confirmed_item_name: str,
         confirmed_category: str,
+        required_aspects: list[dict] | None = None,
     ) -> ProductIdentification:
-        image_data, media_type = self._encode_image(image_path)
-        local_context = json.dumps(local_classification.to_dict(), indent=2)
-
         prompt_text = (
-            f"Local ResNet50 classifier output:\n{local_context}\n\n"
             f'The user has confirmed this item is: "{confirmed_item_name}", '
             f'in eBay category: "{confirmed_category}". '
-            "Analyze the photo for everything else: brand, model number, condition, and description."
+            "Analyze the photo(s) for everything else: brand, model number, condition, and description."
         )
+        if required_aspects:
+            aspect_lines = []
+            for aspect in required_aspects:
+                values = aspect.get("values") or []
+                values_note = f" (eBay's suggested values include: {', '.join(values[:15])})" if values else ""
+                aspect_lines.append(f"- {aspect['name']}{values_note}")
+            prompt_text += (
+                "\n\neBay requires the following item specifics for this category — look across all "
+                "provided photos (including any tags, labels, or packaging) for each one, and note it "
+                "explicitly in distinguishing_features, using eBay's own suggested wording above when it "
+                "matches what you see (do not fabricate a value you can't actually determine):\n"
+                + "\n".join(aspect_lines)
+            )
+
+        content = self._image_blocks(images)
+        content.append({"type": "text", "text": prompt_text})
 
         response = self.client.messages.parse(
             model=self.model,
             max_tokens=1024,
             system=_SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }],
+            messages=[{"role": "user", "content": content}],
             output_format=ProductIdentification,
         )
         identification = response.parsed_output
@@ -156,21 +168,24 @@ class VisionSubagent:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the local classifier + Claude Vision Subagent on an image.")
+    parser = argparse.ArgumentParser(description="Run the Claude Vision Subagent on an image.")
     parser.add_argument("image_path", type=str, help="Path to an image file")
     parser.add_argument("--model", type=str, default="claude-sonnet-5")
     args = parser.parse_args()
 
-    local_result = VisionPreprocessor().classify(args.image_path)
+    path = Path(args.image_path)
+    media_type = _MEDIA_TYPES.get(path.suffix.lower(), "image/jpeg")
+    images = [(path.read_bytes(), media_type)]
+
     subagent = VisionSubagent(model=args.model)
 
     # No human in the loop for this standalone CLI — chain preview straight into
     # identify() using its own guesses as "confirmed", unlike the web app's flow where a
     # user reviews/edits them in between.
-    preview = subagent.preview(args.image_path, local_result)
+    preview = subagent.preview(images)
     print("Preview:", preview.model_dump_json(indent=2))
 
-    identification = subagent.identify(args.image_path, local_result, preview.item_name, preview.category)
+    identification = subagent.identify(images, preview.item_name, preview.category)
     print(identification.model_dump_json(indent=2))
 
 

@@ -632,7 +632,7 @@ def upload_site_hosted_picture(config: EbayConfig, token: str, image_bytes: byte
 
 def _build_add_fixed_price_item_request(
     identification: ProductIdentification,
-    image_url: str,
+    image_urls: list[str],
     price: float,
     weight_lbs: float,
     currency: str,
@@ -663,7 +663,8 @@ def _build_add_fixed_price_item_request(
     _sub(item, "ListingType", "FixedPriceItem")
 
     picture_details = _sub(item, "PictureDetails")
-    _sub(picture_details, "PictureURL", image_url)
+    for url in image_urls:
+        _sub(picture_details, "PictureURL", url)
 
     if data.aspects:
         item_specifics = _sub(item, "ItemSpecifics")
@@ -704,7 +705,7 @@ class CreateListingResult(BaseModel):
 def create_listing(
     identification: ProductIdentification,
     upload_id: str,
-    image_url: str,
+    image_urls: list[str],
     price: float,
     weight_lbs: float,
     currency: str = "USD",
@@ -718,6 +719,10 @@ def create_listing(
     which never calls this). Grep for AddFixedPriceItem/create_listing as a guardrail
     check before merging any change that touches this file — it should appear in
     exactly this one function and its call sites, nowhere implicit.
+
+    `image_urls` can be up to MAX_IMAGES (see app.py) Supabase-hosted photos — every
+    one of them is re-hosted on EPS and attached to the listing (see the loop below),
+    not just a single primary photo.
     """
     config = load_ebay_config()
     token = get_valid_access_token(config)
@@ -727,20 +732,24 @@ def create_listing(
     if location is None:
         raise RuntimeError("No shipping location saved yet — set one up before publishing.")
 
-    # Re-host on eBay's own Picture Services (EPS) rather than pointing
-    # PictureDetails/PictureURL at the Supabase URL directly — see
+    # Re-host every photo on eBay's own Picture Services (EPS) rather than pointing
+    # PictureDetails/PictureURL at the Supabase URLs directly — see
     # upload_site_hosted_picture()'s docstring for why self-hosted URLs are unreliable
-    # here. Supabase stays the durable source of truth for the image itself; this just
-    # changes what URL gets handed to eBay for this one listing.
-    image_response = httpx.get(image_url, timeout=30.0)
-    image_response.raise_for_status()
-    eps_picture_url = upload_site_hosted_picture(config, token, image_response.content, sku)
+    # here. Supabase stays the durable source of truth for the images themselves; this
+    # just changes what URLs get handed to eBay for this one listing. Sequential, not
+    # parallel — matches this codebase's style elsewhere, at the cost of added publish
+    # latency roughly proportional to photo count.
+    eps_picture_urls = []
+    for i, image_url in enumerate(image_urls):
+        image_response = httpx.get(image_url, timeout=30.0)
+        image_response.raise_for_status()
+        eps_picture_urls.append(upload_site_hosted_picture(config, token, image_response.content, f"{sku}-{i}"))
 
     query = build_query(identification)
     data = _resolve_listing_data(config, token, identification, query, category_id_override=identification.category_id)
 
     request_root = _build_add_fixed_price_item_request(
-        identification, eps_picture_url, price, weight_lbs, currency, quantity, data, location, sku
+        identification, eps_picture_urls, price, weight_lbs, currency, quantity, data, location, sku
     )
     response_root = _call_trading_api(config, token, "AddFixedPriceItem", request_root)
     item_id = response_root.findtext(".//eb:ItemID", namespaces=_NS)

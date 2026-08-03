@@ -1,11 +1,9 @@
-"""FastAPI app: image upload -> local classifier -> Claude Vision Subagent -> eBay comps/listing."""
+"""FastAPI app: multi-photo upload -> Claude Vision Subagent -> eBay comps/listing."""
 
 from __future__ import annotations
 
-import gc
 import io
 import logging
-import threading
 import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -21,10 +19,9 @@ from pydantic import BaseModel
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, get_application_access_token, load_ebay_browse_config, search_comparable_listings
 from src.ebay.config import load_ebay_config
-from src.ebay.listing import EbayTradingApiError, create_listing, resolve_draft_listing, suggest_categories
+from src.ebay.listing import EbayTradingApiError, create_listing, get_required_aspects, resolve_draft_listing, suggest_categories
 from src.ebay.seller_location import save_seller_location
 from src.ebay.token_store import get_valid_access_token
-from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.storage.supabase_storage import load_supabase_storage_config, public_url, upload_image
 from src.web.ebay_routes import router as ebay_router
 
@@ -38,16 +35,23 @@ T = TypeVar("T")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-# eBay's own Inventory API image requirements: below 500px on either dimension, "the
-# listing may be blocked" — silently, not with a clean rejection at listing-creation
-# time, which is exactly the "image not showing up" failure mode this guards against.
+# An item can have up to this many photos, all of which get attached to the eBay
+# listing itself (see src/ebay/listing.py's create_listing()) — but only the first
+# MAX_ANALYSIS_IMAGES are sent to Claude for identification, since a handful of angles
+# is enough to identify an item and analyzing all 10 would multiply vision-call cost
+# for little added benefit.
+MAX_IMAGES = 10
+MAX_ANALYSIS_IMAGES = 5
+# eBay's own image requirements: below 500px on either dimension, "the listing may be
+# blocked" — silently, not with a clean rejection at listing-creation time, which is
+# exactly the "image not showing up" failure mode this guards against.
 EBAY_MIN_IMAGE_DIMENSION = 500
 # eBay's own docs say "preferably at least 1600 by 1600 pixels" — not a hard minimum,
 # just a quality preference — so downscaling anything larger than this to 1600px on its
 # longest side stays within eBay's own guidance while capping how much raw pixel data
-# gets processed by local ResNet50 inference (twice — once each in the preview/confirm
-# phases) and base64-encoded for each Claude vision call. Full-resolution modern phone
-# photos (4000px+) were plausibly large enough to push Render's free-tier request past
+# gets base64-encoded for each Claude vision call and uploaded to Supabase/eBay. A
+# full-resolution modern phone photo (4000px+, several MB), multiplied by up to 10
+# photos per item, was plausibly large enough to push Render's free-tier request past
 # its timeout or memory limit with zero application-level logging — the request dies
 # mid-flight (a 502 from Render's own proxy, not one of this app's own error responses)
 # before any of our own logging or error handling ever runs.
@@ -56,28 +60,15 @@ EBAY_MAX_IMAGE_DIMENSION = 1600
 # Built once, reused for every color-managed conversion in _to_srgb() below.
 _SRGB_PROFILE = ImageCms.createProfile("sRGB")
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-UPLOAD_DIR = _PROJECT_ROOT / "data" / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="AgentX")
 app.include_router(ebay_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Loaded once at process startup — ResNet50 weight loading and API client
-# construction are both too expensive to redo per request.
-_preprocessor = VisionPreprocessor()
+# Loaded once at process startup — API client construction is too expensive to redo
+# per request.
 _vision_subagent = VisionSubagent()
-
-# Serializes local ResNet50 inference across requests. Each `/api/identify` call
-# runs in its own thread-pool thread (FastAPI's default for sync routes), so
-# multiple images uploaded in quick succession would otherwise run CPU inference
-# concurrently — each pass is memory-hungry enough that 2-3 at once can exceed a
-# constrained container's memory limit (observed causing OOM crashes on Render's
-# free tier). This queues them instead of running them in parallel; Claude API
-# calls afterward are network-bound and stay unserialized.
-_inference_lock = threading.Lock()
 
 
 @app.get("/")
@@ -127,7 +118,7 @@ def _to_srgb(image: Image.Image) -> Image.Image:
 def _validate_and_normalize_image(contents: bytes) -> bytes:
     """Validates dimensions and always re-encodes to JPEG (downscaling first if needed)
     — unconditionally, not just when downscaling. This keeps every upload's Supabase
-    Storage object path fully deterministic (`{upload_id}.jpg`, see
+    Storage object path fully deterministic (`{upload_id}/{index}.jpg`, see
     src/storage/supabase_storage.py), so nothing downstream ever needs to track or look
     up the original file's format/extension. Minor tradeoff: already-small JPEGs get a
     redundant re-compression pass at quality=88 (visually near-lossless for product
@@ -158,17 +149,17 @@ def _validate_and_normalize_image(contents: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _save_upload(file: UploadFile) -> Path:
+def _read_and_normalize_upload(file: UploadFile) -> bytes:
+    """Reads, validates, and normalizes one uploaded file to JPEG bytes — entirely
+    in-memory. No local disk staging: the only thing that ever needed a real file path
+    was the local ResNet50 classifier, which this app no longer has, so photos go
+    straight from upload to Supabase (see /api/identify below)."""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'unknown'}")
 
     contents = _read_upload_within_limit(file, MAX_UPLOAD_BYTES)
-    contents = _validate_and_normalize_image(contents)
-    upload_id = uuid.uuid4().hex
-    path = UPLOAD_DIR / f"{upload_id}.jpg"
-    path.write_bytes(contents)
-    return path
+    return _validate_and_normalize_image(contents)
 
 
 def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
@@ -220,33 +211,44 @@ def _call_storage(fn: Callable[..., T], *args, **kwargs) -> T:
         raise HTTPException(status_code=503, detail="Could not reach Supabase Storage. Please try again.")
 
 
+def _fetch_image(url: str) -> bytes:
+    response = httpx.get(url, timeout=30.0)
+    response.raise_for_status()
+    return response.content
+
+
 @app.post("/api/identify")
-def identify(file: UploadFile = File(...)) -> dict:
+def identify(files: list[UploadFile] = File(...)) -> dict:
     """Phase 1 of 2: a cheap preview guess (name + category) only — never the full
     analysis. The user must confirm/edit both via POST /api/identify/confirm before
-    brand/model/condition/description get analyzed at all (see that route below)."""
-    path = _save_upload(file)
-    try:
-        # Uploaded to Supabase Storage immediately — this, not this app's own server,
-        # is what eBay will fetch imageUrls from later (see
-        # src/storage/supabase_storage.py for why: Render's free tier sleeps, but
-        # Supabase doesn't, and eBay fetches images lazily rather than synchronously).
-        storage_config = _call_storage(load_supabase_storage_config)
-        _call_storage(upload_image, storage_config, path.stem, path.read_bytes())
+    brand/model/condition/description get analyzed at all (see that route below).
 
-        with _inference_lock:
-            local_result = _preprocessor.classify(path)
-            # PyTorch's CPU allocator doesn't reliably return freed memory to the OS
-            # between requests, so RSS tends to ratchet upward run over run rather than
-            # reset — on Render's free-tier 512MB limit this reliably OOMs by the second
-            # full identify pass. Forcing collection right after the heaviest allocation
-            # (image tensor + inference) while still holding the lock (so it can't race
-            # a concurrent classify()) measurably reduces that carryover.
-            gc.collect()
-        preview = _call_claude(_vision_subagent.preview, path, local_result)
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+    Accepts up to MAX_IMAGES photos of the same item — all of them get attached to the
+    eBay listing itself at publish time (see src/ebay/listing.py's create_listing()),
+    but only the first MAX_ANALYSIS_IMAGES are sent to Claude here and in
+    /api/identify/confirm below.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one photo is required.")
+    if len(files) > MAX_IMAGES:
+        raise HTTPException(status_code=400, detail=f"Up to {MAX_IMAGES} photos are allowed per item.")
+
+    # Validate/normalize every file into memory *before* uploading any of them, so a
+    # single bad file (e.g. too small) aborts cleanly with nothing partially written to
+    # Supabase.
+    normalized_images = [_read_and_normalize_upload(f) for f in files]
+
+    upload_id = uuid.uuid4().hex
+    storage_config = _call_storage(load_supabase_storage_config)
+    # Uploaded to Supabase Storage immediately — this, not this app's own server, is
+    # what eBay will fetch imageUrls from later (see src/storage/supabase_storage.py
+    # for why: Render's free tier sleeps, but Supabase doesn't, and eBay fetches images
+    # lazily rather than synchronously).
+    for i, image_bytes in enumerate(normalized_images):
+        _call_storage(upload_image, storage_config, upload_id, i, image_bytes)
+
+    analysis_images = [(b, "image/jpeg") for b in normalized_images[:MAX_ANALYSIS_IMAGES]]
+    preview = _call_claude(_vision_subagent.preview, analysis_images)
 
     # Application-level (client-credentials) eBay token, not the user's OAuth one —
     # category suggestions are public Taxonomy data, so this works even before the user
@@ -255,13 +257,10 @@ def identify(file: UploadFile = File(...)) -> dict:
     app_token = _call_ebay(get_application_access_token, browse_config)
     suggestions = _call_ebay(suggest_categories, browse_config, app_token, preview.category)
 
-    # The local file is kept only for the confirm step below, which also needs local
-    # classify()/Claude vision access — it's deleted right after that (see
-    # /api/identify/confirm), since everything downstream of confirmation (price lookup,
-    # draft creation, publish) uses the Supabase-hosted copy instead.
     return {
         "status": "preview",
-        "upload_id": path.stem,
+        "upload_id": upload_id,
+        "image_count": len(files),
         "item_name": preview.item_name,
         "category_suggestions": [s.model_dump() for s in suggestions],
     }
@@ -286,36 +285,44 @@ class ConfirmItemRequest(BaseModel):
     item_name: str
     category_id: str
     category_name: str
+    image_count: int
 
 
 @app.post("/api/identify/confirm")
 def confirm_item(payload: ConfirmItemRequest) -> dict:
     """Phase 2 of 2: the full Claude analysis (brand/model/condition/description),
     run only after the user has confirmed a real item name + eBay category — those are
-    passed in as ground truth context rather than re-guessed."""
-    matches = list(UPLOAD_DIR.glob(f"{payload.upload_id}.*"))
-    if not matches:
-        raise HTTPException(status_code=404, detail="Upload not found or already processed")
-    path = matches[0]
+    passed in as ground truth context rather than re-guessed.
 
-    try:
-        with _inference_lock:
-            local_result = _preprocessor.classify(path)
-            gc.collect()
-        identification = _call_claude(
-            _vision_subagent.identify, path, local_result, payload.item_name, payload.category_name
-        )
-    finally:
-        # The local temp file is only ever needed for local classify()/Claude vision
-        # calls, both of which are done (successfully or not) by this point —
-        # everything downstream (price lookup, draft creation, publish) uses the
-        # Supabase-hosted copy uploaded back in /api/identify instead. Deleting it here
-        # unconditionally also means local uploads no longer accumulate indefinitely
-        # for abandoned flows the way they used to.
-        path.unlink(missing_ok=True)
+    This is a separate HTTP request from /api/identify with no server-side session
+    state, so the first MAX_ANALYSIS_IMAGES photos are re-fetched from their
+    already-uploaded Supabase public URLs rather than kept in memory across requests.
+    """
+    storage_config = _call_storage(load_supabase_storage_config)
+    analysis_count = min(payload.image_count, MAX_ANALYSIS_IMAGES)
+    analysis_images = [
+        (_call_storage(_fetch_image, public_url(storage_config, payload.upload_id, i)), "image/jpeg")
+        for i in range(analysis_count)
+    ]
+
+    # Application-level eBay token — needed to fetch this category's required item
+    # specifics so identify() can actively look for each one across all photos (e.g. a
+    # size printed on a tag), rather than relying purely on post-hoc text matching in
+    # listing.py's resolve_aspects().
+    browse_config = _call_ebay(load_ebay_browse_config)
+    app_token = _call_ebay(get_application_access_token, browse_config)
+    required_aspects = _call_ebay(get_required_aspects, browse_config, app_token, payload.category_id)
+
+    identification = _call_claude(
+        _vision_subagent.identify,
+        analysis_images,
+        payload.item_name,
+        payload.category_name,
+        required_aspects,
+    )
 
     identification.category_id = payload.category_id
-    return {"status": "complete", "upload_id": path.stem, "result": identification.model_dump()}
+    return {"status": "complete", "upload_id": payload.upload_id, "result": identification.model_dump()}
 
 
 def _call_ebay(fn: Callable[..., T], *args, **kwargs) -> T:
@@ -406,6 +413,7 @@ class PublishListingRequest(BaseModel):
     price: float
     weight_lbs: float
     currency: str = "USD"
+    image_count: int
 
 
 @app.post("/api/listing/publish/{upload_id}")
@@ -416,12 +424,12 @@ def publish_listing_route(upload_id: str, payload: PublishListingRequest) -> dic
     unpublished state to review beforehand; this route is only ever called from an
     explicit user click after that review, never automatically."""
     storage_config = _call_storage(load_supabase_storage_config)
-    image_url = public_url(storage_config, upload_id)
+    image_urls = [public_url(storage_config, upload_id, i) for i in range(payload.image_count)]
     result = _call_ebay(
         create_listing,
         payload.identification,
         upload_id,
-        image_url,
+        image_urls,
         payload.price,
         payload.weight_lbs,
         payload.currency,

@@ -5,19 +5,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project overview
 
 AgentX (repo name `EbayAiX`) is a portfolio project demonstrating production-grade AI agent architecture: an
-e-commerce helper that ingests a photo of a physical item, identifies it, prices it, and drafts a live eBay
-listing. It's built to showcase Agent Architecture Design, Computer Vision (local + cloud), Agentic Search,
-and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so code should reflect deliberate,
-enterprise-style patterns rather than the shortest path to a working demo.
+e-commerce helper that ingests photos of a physical item, identifies it, prices it, and drafts a live eBay
+listing. It's built to showcase Agent Architecture Design, Computer Vision (via Claude's vision analysis),
+Agentic Search, and AI Governance (Human-in-the-Loop controls) as resume-relevant skills, so code should
+reflect deliberate, enterprise-style patterns rather than the shortest path to a working demo.
 
-So far: local image classification, a two-phase Claude-based structured identification (a cheap name+category
-guess, confirmed/corrected by a human, then a fuller analysis informed by that confirmation), a low-cost eBay
+So far: multi-photo upload (up to 10 photos of an item), a two-phase Claude-based structured identification
+(a cheap name+category guess, confirmed/corrected by a human, then a fuller analysis informed by that
+confirmation and by eBay's own required item-specifics for the confirmed category), a low-cost eBay
 comparable-listings lookup (no LLM involved), real eBay listing creation via the legacy Trading API
-(`AddFixedPriceItem`), an in-app listing preview + explicit publish step, a FastAPI front end chaining all of
-it together, and an eBay OAuth 2.0 connect flow. The Claude-based orchestrator tying these steps together
-programmatically, and a more general HITL approval gate, are still future work (see "Planned architecture")
-— but both the mandatory identify/confirm step and the in-app review-then-publish flow already built are
-this project's concrete instances of that gate.
+(`AddFixedPriceItem`, with every uploaded photo attached), an in-app listing preview + explicit publish step,
+a FastAPI front end chaining all of it together, and an eBay OAuth 2.0 connect flow. The Claude-based
+orchestrator tying these steps together programmatically, and a more general HITL approval gate, are still
+future work (see "Planned architecture") — but both the mandatory identify/confirm step and the in-app
+review-then-publish flow already built are this project's concrete instances of that gate.
 
 **Important finding that shaped the publish flow, and later reshaped it again:** this project originally
 created listings via eBay's newer Inventory API (`createOrReplaceInventoryItem` + `createOffer` +
@@ -51,10 +52,8 @@ Environment is managed by `uv` (Python 3.14, `.venv/`). No test suite or linter 
 uv sync                                   # install/sync dependencies from pyproject.toml / uv.lock
 uv add <package>                          # add a new dependency
 
-# Local ResNet50 classifier, standalone
-uv run python -m src.ml.vision_preprocessor <image_path> [--top-k N] [--device cpu|mps]
-
-# Full pipeline: local classifier -> Claude Vision Subagent
+# Vision Subagent CLI, standalone (single local image, no human confirmation step —
+# chains preview() straight into identify() using preview's own guess as "confirmed")
 uv run python -m src.agents.vision_subagent <image_path> [--model claude-sonnet-5]
 
 # Web app (upload UI + API), served at http://127.0.0.1:8000
@@ -63,14 +62,6 @@ uv run uvicorn src.web.app:app --reload
 
 `ANTHROPIC_API_KEY` must be set in `.env` (see `.env.example`) for anything in `src/agents/` to work —
 loaded via `python-dotenv`.
-
-**macOS SSL gotcha:** a python.org framework build of Python has no CA bundle configured by default, so the
-first `torch.hub` weights download in `vision_preprocessor.py` can fail with `SSLCertVerificationError`. Fix
-by pointing at the `certifi` bundle already pulled in as an `anthropic` dependency:
-```bash
-SSL_CERT_FILE=$(uv run python -c "import certifi; print(certifi.where())") uv run python -m src.ml.vision_preprocessor <image_path>
-```
-Only needed once — the ResNet50 weights are then cached under `~/.cache/torch/hub/checkpoints/`.
 
 `EBAY_APP_ID`, `EBAY_CERT_ID`, `EBAY_RU_NAME` (and `EBAY_ENVIRONMENT`, default `sandbox`) must be set in
 `.env` for the OAuth connect flow to work. `EBAY_RU_NAME` is not a URL — it's the RuName string eBay
@@ -96,17 +87,14 @@ retroactively gain scopes. Fix: click "Connect eBay account" again.
 
 ## Deployment
 
-`Dockerfile` builds the whole app (FastAPI + PyTorch) as one image, targeting Render (see `render.yaml`) —
-chosen over serverless platforms (Vercel, etc.) because PyTorch/ResNet50 and the file-based upload/token
-storage don't fit a stateless serverless model. Key details baked into the Dockerfile:
+`Dockerfile` builds the whole app (FastAPI) as one image, targeting Render (see `render.yaml`) — chosen over
+serverless platforms (Vercel, etc.) because the file-based token/location storage (`token_store.py`,
+`seller_location.py`) doesn't fit a stateless serverless model. Key details baked into the Dockerfile:
 
-- **CPU-only PyTorch on Linux.** `pyproject.toml`'s `[tool.uv.sources]` routes `torch`/`torchvision` to
-  `https://download.pytorch.org/whl/cpu` when `platform_system != 'Darwin'`. Without this, `uv` resolves the
-  default CUDA build on Linux — several GB of unneeded `nvidia-*` packages. macOS dev is unaffected (no CUDA
-  variant exists there anyway; MPS still works locally).
-- **ResNet50 weights are baked in at build time** (`RUN uv run python -c "from src.ml.vision_preprocessor
-  import VisionPreprocessor; VisionPreprocessor()"`) so a cold start on Render's free tier (which spins down
-  after inactivity) doesn't need a ~100MB download before the server can respond.
+- **`ENV MALLOC_ARENA_MAX=1`** caps glibc to a single malloc arena, which reliably releases freed memory back
+  to the OS (unlike the multi-arena default, a well-known cause of RSS ratcheting upward across requests
+  rather than resetting) — worthwhile on Render's free-tier 512MB limit given this app can process up to 10
+  photos per identify request (Pillow resize/convert + base64-encoding for Claude vision calls).
 - **uvicorn is started with `--proxy-headers --forwarded-allow-ips='*'`.** Render terminates TLS at its edge
   and forwards plain HTTP internally, so without trusting `X-Forwarded-Proto`, `request.base_url` (used by
   `_public_base_url()` in `app.py` to build the `imageUrls` eBay fetches) silently resolves to `http://`
@@ -126,31 +114,35 @@ instead). This is one of the reasons the app needs a real HTTPS deployment rathe
 
 ## Architecture
 
-Two independent stages exist today, chained by `src/agents/vision_subagent.py`'s `main()`:
-
-**`src/ml/vision_preprocessor.py`** — local-only, no network calls. `VisionPreprocessor` loads a pretrained
-ResNet50 (`torchvision.models.ResNet50_Weights.DEFAULT`) once, auto-selects `mps`/`cpu`, and exposes
-`classify(image_path) -> ClassificationResult`. `ClassificationResult`/`Prediction` are dataclasses with
-`to_dict()`/`to_json()` — this is the JSON-serializable "local ML metadata" handed to the Claude layer.
-
 **`src/agents/vision_subagent.py`** — calls the Claude API, in two deliberate phases with a mandatory human
 checkpoint between them, per explicit direction: name and category affect everything downstream (comparable-
 listings search, eBay category-specific condition/aspect rules, buyer discoverability), so they're confirmed
-*first* rather than being just another guess the user might fix later.
+*first* rather than being just another guess the user might fix later. There's no local ML pre-pass anymore
+(an earlier local ResNet50 classifier stage was removed entirely per explicit direction, judged unnecessary
+overhead — Claude's own vision analysis is what actually drives identification); both phases take one or
+more photos directly.
 
-`VisionSubagent.preview(image_path, local_classification) -> ItemPreview` — a cheap first pass
-(`max_tokens=256`) that returns only `item_name` + a free-text `category` guess, base64-encoding the image
-and using the local classifier's JSON output as context exactly like `identify()` below. This is what
-`POST /api/identify` calls; the result is never used directly for listing creation, only to seed the
-confirm-step UI (see `app.py` below).
+`VisionSubagent.preview(images: list[tuple[bytes, str]]) -> ItemPreview` — a cheap first pass
+(`max_tokens=256`) that returns only `item_name` + a free-text `category` guess. `images` is a list of
+`(image_bytes, media_type)` pairs, each turned into its own `{"type": "image", ...}` content block in a
+single Claude message — Claude supports several images per message natively, so multiple angles of the same
+item (including a tag or label photo) are examined together rather than one at a time. This is what
+`POST /api/identify` calls (with up to `MAX_ANALYSIS_IMAGES` photos — see `app.py` below); the result is
+never used directly for listing creation, only to seed the confirm-step UI.
 
-`VisionSubagent.identify(image_path, local_classification, confirmed_item_name, confirmed_category) ->
+`VisionSubagent.identify(images, confirmed_item_name, confirmed_category, required_aspects=None) ->
 ProductIdentification` — the fuller analysis, only ever run *after* a human has confirmed/edited the name and
 picked a real eBay category (see `app.py`'s `/api/identify/confirm`). `confirmed_item_name`/`confirmed_category`
 are required params, not an optional override — the system prompt tells Claude to treat them as ground truth
 and analyze everything else (brand, model number, condition, description); after parsing, `identify()`
 defensively overwrites `item_name`/`category` on the result with the confirmed strings rather than trusting
-the model to echo them back exactly. Uses structured outputs
+the model to echo them back exactly. `required_aspects` (eBay's required item specifics for the confirmed
+category, from `listing.py`'s `get_required_aspects()` — see `app.py`'s `/api/identify/confirm` below) is
+optional but always passed in practice; when given, the prompt explicitly lists what eBay requires (e.g.
+"Brand, Model, Type, Connectivity, Color") and asks Claude to look across all provided photos — including
+tags/labels/packaging — for each one, using eBay's own suggested vocabulary where it matches. This directly
+improves `resolve_aspects()`'s word-boundary text-matching in `listing.py` (unchanged code, richer input)
+rather than requiring any change to that matching logic itself. Uses structured outputs
 (`client.messages.parse(..., output_format=ProductIdentification)`) to force a strict schema: item name,
 brand, model number, category, `category_id` (the confirmed real eBay categoryId, set by the caller —
 Claude never produces this), a constrained condition enum, condition notes, a buyer-facing
@@ -188,98 +180,75 @@ limitation (confirmed against multiple independent developer reports), not a bug
 read-only, public-data search with no side effects, so production credentials here carry none of the risk
 that using production for listing creation would.
 
-**`src/web/app.py`** — the FastAPI front end. `POST /api/identify` saves the upload to `data/uploads/`
-(git-ignored, size-capped at 10MB, extension-allowlisted to jpg/jpeg/png/webp — all formats eBay accepts,
-confirmed against eBay's own docs) after `_validate_and_normalize_image()` opens it with Pillow,
-rejects anything under `EBAY_MIN_IMAGE_DIMENSION` (500px) on either side with a clear 400 — eBay's own docs
-say a smaller image "may be blocked" from the listing, silently, which is a worse failure mode (a seemingly
-successful publish with a broken image) than rejecting it up front at upload time — and **downscales anything
-over `EBAY_MAX_IMAGE_DIMENSION` (1600px, matching eBay's own "preferably at least 1600x1600" guidance) to
-1600px on its longest side, always re-encoding as JPEG (`.jpg`) regardless of original format when it does.**
-This exists because full-resolution modern phone photos (4000px+, several MB) were plausibly large enough —
-run through local ResNet50 inference *twice* (once each in the preview and confirm phases) and base64-encoded
-for *two* separate Claude vision calls — to push a request past Render's free-tier timeout or memory limit.
-The observed symptom was a bare 502 in the browser with **zero** matching Render log output: the request died
-mid-flight (Render's own proxy giving up, or an OOM kill) before this app's own logging or error handling ever
-ran, which is a very different (and much less diagnosable) failure mode than this app's normal 4xx/502/503
-JSON error responses. `/api/identify` normalizes every upload to JPEG unconditionally (not just when downscaling — see
-`_validate_and_normalize_image()`), which keeps every upload's storage object path fully deterministic
-(`{upload_id}.jpg`), and immediately uploads it to **Supabase Storage** (`src/storage/supabase_storage.py`,
-see below) before doing anything else — confirmed via a synthetic 4032x3024 upload through the real endpoint
-that the saved file is correctly downscaled to 1600x1200. Then runs the local classifier +
-`VisionSubagent.preview()` (Phase 1 — cheap name+category guess, see `vision_subagent.py` above), followed
-immediately by `suggest_categories()` (`listing.py`, using the *application-level* `browse.py` token, not the
-user's OAuth one — Taxonomy category suggestions are public data, so this works even before the user has
-connected their own eBay account, same reasoning as `browse.py`'s comp pricing) to turn that free-text
-category guess into a handful of real, valid eBay categories. Returns `{status: "preview", upload_id,
-item_name, category_suggestions}` — always this shape, no confidence-based branching anymore (the mandatory
-confirm step below replaces what used to be a conditional "needs_clarification" path for low-confidence
-guesses only).
+**`src/web/app.py`** — the FastAPI front end. `POST /api/identify` accepts 1-`MAX_IMAGES` (10) photos of the
+same item (`files: list[UploadFile]` — FastAPI's native multi-file support, matched by repeated `file` fields
+in the frontend's `FormData`). Every file is read, extension-allowlisted (jpg/jpeg/png/webp — all formats
+eBay accepts, confirmed against eBay's own docs), size-capped at 10MB, and validated/normalized *entirely in
+memory* via `_validate_and_normalize_image()` — rejects anything under `EBAY_MIN_IMAGE_DIMENSION` (500px) on
+either side with a clear 400 (eBay's own docs say a smaller image "may be blocked" from the listing,
+silently, which is a worse failure mode than rejecting it up front), and **downscales anything over
+`EBAY_MAX_IMAGE_DIMENSION` (1600px, matching eBay's own "preferably at least 1600x1600" guidance) to 1600px
+on its longest side, always re-encoding as JPEG regardless of original format.** This exists because
+full-resolution modern phone photos (4000px+, several MB), multiplied by up to 10 per item and base64-encoded
+for Claude vision calls, were plausibly large enough to push a request past Render's free-tier timeout or
+memory limit — the observed symptom was a bare 502 with **zero** matching Render log output (the request
+died mid-flight, before this app's own logging/error handling ever ran), a much less diagnosable failure mode
+than this app's normal 4xx/502/503 JSON responses. *Every* file is validated/normalized before *any* of them
+are uploaded, so one bad photo aborts the whole request cleanly rather than leaving a partial set in Supabase.
+Each normalized image is then uploaded to **Supabase Storage** (`src/storage/supabase_storage.py`, see
+below) at `{upload_id}/{index}.jpg`. Only the first `MAX_ANALYSIS_IMAGES` (5) go to
+`VisionSubagent.preview()` (Phase 1 — cheap name+category guess, see `vision_subagent.py` above) — all N
+still get attached to the eBay listing itself at publish time (see `listing.py` below), but analyzing more
+than a handful of angles has little added identification benefit for meaningfully higher Claude cost.
+Immediately after, `suggest_categories()` (`listing.py`, using the *application-level* `browse.py` token, not
+the user's OAuth one — Taxonomy category suggestions are public data, so this works even before the user has
+connected their own eBay account, same reasoning as `browse.py`'s comp pricing) turns that free-text category
+guess into a handful of real, valid eBay categories. Returns `{status: "preview", upload_id, image_count,
+item_name, category_suggestions}` — `image_count` lets the frontend carry the photo count forward through
+confirm/publish without the backend needing to track any server-side session state.
 
 **New `POST /api/categories/search`** — same `suggest_categories()` call, for the frontend's re-search box
 when none of the initial suggestions fit different search terms than the LLM's own guess.
 
 **`POST /api/identify/confirm`** (this used to be `/api/identify/refine`, with a materially different
 contract — renamed since it's no longer "refine a low-confidence guess" but "run the full analysis now that
-name+category are confirmed"). Body: `{upload_id, item_name, category_id, category_name}` — all mandatory,
-never optional. Re-runs the local classifier, then calls `VisionSubagent.identify(path, local_result,
-item_name, category_name)` (Phase 2 — the full analysis, informed by the *confirmed* name/category rather
-than re-guessing them), sets `identification.category_id = category_id` on the result (Claude never produces
+name+category are confirmed"). Body: `{upload_id, item_name, category_id, category_name, image_count}` — all
+mandatory, never optional. Since this is a separate HTTP request from `/api/identify` with no server-side
+session state, it re-fetches the first `min(image_count, MAX_ANALYSIS_IMAGES)` photos via `httpx.get()` on
+their already-uploaded Supabase public URLs (same pattern `create_listing()` in `listing.py` uses to re-fetch
+an image before EPS upload) rather than keeping anything in memory across requests. It also fetches this
+category's required item specifics via `get_required_aspects()` (`listing.py`, reused as-is, using the same
+application-level Taxonomy token) *before* calling `VisionSubagent.identify()` (Phase 2 — the full analysis,
+informed by the *confirmed* name/category and by what eBay actually requires for this category, rather than
+re-guessing either), sets `identification.category_id = category_id` on the result (Claude never produces
 this — it's the real eBay Taxonomy ID the user picked), and returns the final `ProductIdentification`. Every
 downstream step (`/api/price`, `/api/listing/draft`, the edit-before-publish screen,
 `/api/listing/publish/{upload_id}`) is unchanged — they already just consume whatever `ProductIdentification`
 is in the frontend's `currentIdentification`.
 
-**Image lifecycle: local disk is now only a short-lived staging area; Supabase Storage is the durable
-store.** The local temp file (`data/uploads/{upload_id}.jpg`) is needed only for local
-classify()/Claude-vision access, and both of those calls are done — successfully or not — by the end of
-`/api/identify/confirm`, which now deletes it unconditionally (a `finally` block, not just on failure) right
-there. This is a deliberate change from the prior design (which kept the local file all the way through
-draft creation and publish): moving the durable copy to Supabase means local uploads no longer accumulate
-indefinitely for abandoned flows — the old "no cleanup job" limitation for `data/uploads/` is gone. Every
-route from that point on (`/api/listing/draft`, `.../update`, `/api/listing/publish/{upload_id}`) needs zero
-local file access at all — `public_url(config, upload_id)` reconstructs the Supabase image URL purely from
-the deterministic `{upload_id}.jpg` naming, no existence check needed, since `upload_image()` already
-succeeded synchronously back in `/api/identify` (if that failed, the flow never got this far).
+**Image lifecycle: no local disk staging at all — Supabase Storage is the only durable store.** Removing the
+local ResNet50 classifier (which needed a real file path — see `vision_subagent.py` above) removed the only
+reason this app ever kept a local temp file: every remaining consumer (Claude's vision calls) only ever
+needed image *bytes*. Photos now go straight from upload -> in-memory validation/normalization -> Supabase,
+for any number of photos, with nothing ever written to local disk. `public_url(config, upload_id, index)`
+reconstructs each Supabase image URL purely from the deterministic `{upload_id}/{index}.jpg` naming, no
+existence check needed, since `upload_image()` already succeeded synchronously back in `/api/identify` (if
+that failed, the flow never got this far).
 
-**The Supabase object is never automatically deleted, even after a successful publish — this was tried and
+**The Supabase objects are never automatically deleted, even after a successful publish — this was tried and
 reverted after a real recurrence of the "image not available" bug.** The first version of this integration
-deleted it right after `publish_listing_route()`'s `create_listing()` call returned, on the reasoning that
-publish success meant eBay was done needing the image. That reasoning was wrong: a successful publish
-doesn't mean eBay has actually *fetched* the `PictureURL` yet — that fetch is lazy/asynchronous, the exact
-same behavior that caused the original pre-Supabase version of this bug — so deleting immediately after
-publish recreated the same race condition one layer further down the pipeline. This finding predates (and is
+deleted the image right after `publish_listing_route()`'s `create_listing()` call returned, on the reasoning
+that publish success meant eBay was done needing it. That reasoning was wrong: a successful publish doesn't
+mean eBay has actually *fetched* the `PictureURL` yet — that fetch is lazy/asynchronous, the exact same
+behavior that caused the original pre-Supabase version of this bug — so deleting immediately after publish
+recreated the same race condition one layer further down the pipeline. This finding predates (and is
 independent of) the later Trading API migration below — it applies equally to `AddFixedPriceItem`'s
-`PictureURL` field. Confirmed the Supabase upload
-and public-URL fetch both work correctly in isolation (a live round-trip test: upload, then an unauthenticated
-GET exactly simulating eBay's fetch, returned the correct bytes and content-type) before concluding the
-premature deletion was the actual cause. Fix: don't delete it at all. A user who abandons the flow, or a
-published listing, both leave a permanent Supabase object; no cleanup job exists for this (same accepted
-tradeoff this codebase already made for local uploads, just without an automatic deletion point at all now).
-
-**Local ResNet50 inference is serialized across requests via `_inference_lock` (a plain `threading.Lock`).**
-Each sync FastAPI route runs in its own thread-pool thread, so without this, multiple images uploaded in
-quick succession would run CPU inference concurrently — observed causing real OOM crashes on Render's
-free-tier memory limit, since each PyTorch CPU inference pass is memory-hungry enough that 2-3 running at
-once exceeds it. The lock only wraps `_preprocessor.classify()`, not the (network-bound) Claude call, so
-those still run concurrently. `VisionPreprocessor.__init__` also sets `torch.set_num_threads(1)` on CPU to
-cut per-inference thread/memory overhead further. The frontend adds a client-side guard on top (disables the
-dropzone/confirm button while a request is in flight) so this is defense-in-depth, not the only line of
-defense — a different client hitting the API directly still can't cause concurrent local inference.
-
-**A second, distinct OOM pattern: crashes reliably on the *second* full identify pass, even with zero
-concurrency** (e.g. completing one flow, refreshing the page, then starting another one). This is a known
-glibc/PyTorch behavior on constrained containers, not a code bug in the traditional sense — glibc's malloc
-creates multiple memory arenas per process, and memory freed within a non-primary arena often isn't returned
-to the OS, so RSS ratchets upward across requests instead of resetting after each one, until it exceeds
-Render's free-tier 512MB limit. Two mitigations: `Dockerfile` sets `ENV MALLOC_ARENA_MAX=1` (caps glibc to a
-single arena it can actually release memory from — verified via `docker run` that the env var reaches the
-container); `app.py`'s `identify()`/`refine()` call `gc.collect()` immediately after `_preprocessor.classify()`
-(still inside `_inference_lock`, so it can't race a concurrent classify() call), forcing CPython to release
-the heaviest per-request allocation (the image tensor + inference pass) promptly rather than waiting on
-normal refcounting/GC timing. If OOM crashes persist after this, the free tier's 512MB may simply be
-insufficient for this stack (PyTorch + ResNet50 + FastAPI + Anthropic/httpx clients) — upgrading Render's
-plan would be the next lever, not further code changes.
+`PictureURL` field(s). Confirmed the Supabase upload and public-URL fetch both work correctly in isolation (a
+live round-trip test: upload, then an unauthenticated GET exactly simulating eBay's fetch, returned the
+correct bytes and content-type) before concluding the premature deletion was the actual cause. Fix: don't
+delete anything. A user who abandons the flow, or a published listing, both leave permanent Supabase objects;
+no cleanup job exists for this (`delete_images()` in `supabase_storage.py` exists as a usable utility for a
+future manual cleanup script, but nothing currently calls it).
 
 Once the confirm step (above) returns a final `ProductIdentification`, the frontend automatically posts it
 (FastAPI validates the JSON body directly against that Pydantic model) to
@@ -335,8 +304,8 @@ looked up on every draft), there's no eBay-side location object to register or q
 just reads the same local file back at publish time. Meant to be run once per deployment (the file is
 git-ignored local state, not per-eBay-account).
 
-The `VisionPreprocessor`/`VisionSubagent` instances are constructed once at module import time and reused
-across requests — re-instantiating per request would reload the ResNet50 weights every call. `_call_claude()`
+The `VisionSubagent` instance is constructed once at module import time and reused across requests —
+re-instantiating per request would recreate the Anthropic client every call. `_call_claude()`
 wraps every Claude-backed call and `_call_ebay()` wraps every eBay-backed call, each translating their
 respective API failures into clean `4xx`/`502`/`503` HTTP responses instead of a bare 500 —
 `_call_claude()` was added after a real Anthropic-side outage surfaced as an unhandled exception during
@@ -355,18 +324,22 @@ logged with a full traceback and a specific error message instead of vanishing i
 
 **`src/storage/supabase_storage.py`** — hosts uploaded item photos on Supabase Storage instead of serving
 them from this app's own Render instance. Raw `httpx` calls to Supabase's Storage REST API, matching this
-project's eBay integration style (no SDK dependency): `upload_image()` (`POST
-/storage/v1/object/{bucket}/{path}` with `apikey` + `Authorization: Bearer` headers both set to the
-secret key, plus `x-upsert: true` so re-running identify for the same `upload_id` overwrites cleanly
-rather than erroring), `public_url()` (pure string construction from `{SUPABASE_URL}/storage/v1/object/public
-/{bucket}/{upload_id}.jpg` — deterministic, never checks existence), and `delete_image()` (`DELETE
-/storage/v1/object/{bucket}` with a JSON `{"prefixes": [...]}` body — Supabase's batch-delete shape, confirmed
-against Supabase's own API docs rather than assumed; best-effort, logs failures instead of raising). Both
-`upload_image()` and `public_url()` log their request/response and the final URL via `logger.info()` — this
-was added specifically to debug a real "image not available" recurrence (see the note on
-`publish_listing_route()` above); `delete_image()` exists as a usable utility (e.g. for a future manual cleanup script) but **nothing
-in this codebase currently calls it** — see below for why. **Why Supabase and not this app's own `/uploads`
-endpoint** (the prior design, now
+project's eBay integration style (no SDK dependency): `upload_image(config, upload_id, index, contents)`
+(`POST /storage/v1/object/{bucket}/{path}` with `apikey` + `Authorization: Bearer` headers both set to the
+secret key, plus `x-upsert: true` so re-running identify for the same `upload_id`/`index` overwrites cleanly
+rather than erroring), `public_url(config, upload_id, index)` (pure string construction from
+`{SUPABASE_URL}/storage/v1/object/public/{bucket}/{upload_id}/{index}.jpg` — deterministic, never checks
+existence), and `delete_images(config, upload_id, image_count)` (`DELETE /storage/v1/object/{bucket}` with a
+JSON `{"prefixes": [...]}` body listing every `{upload_id}/{i}.jpg` path — Supabase's batch-delete shape,
+confirmed against Supabase's own API docs rather than assumed; best-effort, logs failures instead of
+raising). Each item's photos live under a shared `{upload_id}/` prefix, one object per index — this is what
+lets a single item have up to `MAX_IMAGES` (10) photos with a fully deterministic key scheme and no need to
+track a photo count anywhere except the `image_count` field the frontend already carries (see `app.py`
+above). Both `upload_image()` and `public_url()` log their request/response and the final URL via
+`logger.info()` — this was added specifically to debug a real "image not available" recurrence (see the note
+on `publish_listing_route()` above); `delete_images()` exists as a usable utility (e.g. for a future manual
+cleanup script) but **nothing in this codebase currently calls it** — see below for why. **Why Supabase and
+not this app's own `/uploads` endpoint** (the prior design, now
 removed along with `PUBLIC_BASE_URL`): Render's free tier spins down after inactivity, but eBay fetches
 `imageUrls` lazily rather than synchronously when a draft is created — so the old design had a real
 reliability gap where eBay's fetch could land while this app's own instance was asleep. Supabase Storage has
@@ -405,19 +378,31 @@ eBay categories rather than trusting one guess.
 `POST /api/listing/draft` and `POST /api/listing/draft/{upload_id}/update` in `app.py` (there's no separate
 create-vs-update distinction anymore, since there's nothing on eBay to create or update yet; both routes just
 re-run the same dry run against whatever `ProductIdentification` the frontend currently has). `create_listing()`:
-`_resolve_listing_data()` -> `_build_add_fixed_price_item_request()` (builds the full `AddFixedPriceItemRequest`
-XML tree via `xml.etree.ElementTree`'s `Element`/`SubElement` API — **deliberately not hand-rolled string
-templates**, since real titles/categories contain `&`/`<`/`>` (already seen in this project's own data, e.g.
-"Portable Audio & Headphones") that a string template would silently turn into invalid XML; ElementTree
-escapes correctly for free, verified live) -> `_call_trading_api(..., "AddFixedPriceItem", ...)` -> extracts
-`ItemID` from the response and returns a `CreateListingResult` (`item_id`, `listing_url`, `missing`, `notes`).
+for every photo in `image_urls` (up to `MAX_IMAGES`, passed in from `app.py`'s publish route), fetches the
+Supabase-hosted bytes and re-hosts them on eBay's own Picture Services via `upload_site_hosted_picture()` (see
+below) — sequentially, not in parallel, matching this codebase's style elsewhere, at the cost of publish
+latency roughly proportional to photo count — then `_resolve_listing_data()` ->
+`_build_add_fixed_price_item_request()` (builds the full `AddFixedPriceItemRequest` XML tree via
+`xml.etree.ElementTree`'s `Element`/`SubElement` API — **deliberately not hand-rolled string templates**,
+since real titles/categories contain `&`/`<`/`>` (already seen in this project's own data, e.g. "Portable
+Audio & Headphones") that a string template would silently turn into invalid XML; ElementTree escapes
+correctly for free, verified live — with one `PictureDetails/PictureURL` child element per photo, well within
+Trading API's documented ~12-picture-per-listing limit) -> `_call_trading_api(..., "AddFixedPriceItem", ...)`
+-> extracts `ItemID` from the response and returns a `CreateListingResult` (`item_id`, `listing_url`,
+`missing`, `notes`).
 
-**Required item specifics ("aspects") are resolved per category, not just Brand.** Many eBay categories
-reject listing creation outright if required aspects are missing — e.g. Headphones requires
+**Required item specifics ("aspects") are resolved per category, not just Brand — and now actively targeted
+during identification, not just matched after the fact.** Many eBay categories reject listing creation
+outright if required aspects are missing — e.g. Headphones requires
 Brand/Model/Type/Connectivity/Color, not just Brand — surfacing as `errorId 25002` ("item specific X is
 missing"), discovered from a real production error under the prior Inventory API design (the same error
 family as the old merchant-location "Item.Country" case). `get_required_aspects()` fetches these via the
-Taxonomy API's `get_item_aspects_for_category`; `resolve_aspects()` fills them from `identification` data
+Taxonomy API's `get_item_aspects_for_category`; besides its use here, `app.py`'s `/api/identify/confirm` now
+also calls it *before* `VisionSubagent.identify()` and passes the result in as `identify()`'s
+`required_aspects` param (see `vision_subagent.py` above), so Claude actively looks for each required aspect
+across all provided photos during analysis — rather than this function's `resolve_aspects()` being the only
+place trying to recover them, after the fact, from whatever free-text Claude happened to write.
+`resolve_aspects()` fills them from `identification` data
 already available, in order: (1) direct field match for Brand/Model, (2) a **word-boundary** match (not naive
 substring — a naive check for shoe size `"9"` false-positived inside `"Air Max 90"` during testing, since
 fixed with a regex `\b` boundary) of one of eBay's suggested values against the identification's own text,
@@ -485,9 +470,9 @@ via Trading API's `X-EBAY-API-IAF-TOKEN` header rather than the `Authorization: 
 elsewhere in this file use; no changes to `oauth.py`/`token_store.py` were needed for this, since it's the
 same token, just carried differently on the wire.
 
-**Package layout is deliberate:** `src/`, `src/ml/`, `src/agents/`, `src/web/`, `src/ebay/` have no
-`__init__.py` — they work as Python 3.14 implicit namespace packages. Do not add empty `__init__.py` files
-back in; only add one if it needs to hold real code.
+**Package layout is deliberate:** `src/`, `src/agents/`, `src/web/`, `src/ebay/` have no `__init__.py` — they
+work as Python 3.14 implicit namespace packages. Do not add empty `__init__.py` files back in; only add one
+if it needs to hold real code.
 
 ### Planned architecture (not yet built)
 
@@ -505,8 +490,12 @@ not just before the one eBay write) is still future work if the project's scope 
 
 **Known limitations, accepted rather than solved:**
 - No TTL/cleanup for abandoned uploads left in Supabase Storage (see `app.py`/`supabase_storage.py` notes
-  above) — local `data/uploads/` no longer has this problem, since that file is now deleted right after
-  `/api/identify/confirm` regardless of what happens afterward.
+  above) — there's no local disk equivalent of this problem anymore (no local staging at all, see the Image
+  lifecycle note above), but the Supabase side still has no cleanup job.
+- `create_listing()`'s per-photo EPS re-hosting loop (see `listing.py` above) is sequential, not parallel, so
+  publish latency scales roughly linearly with photo count (up to `MAX_IMAGES` = 10) — acceptable given this
+  project's scale, and consistent with the rest of the codebase never using concurrent HTTP calls, but worth
+  revisiting (e.g. `httpx.AsyncClient` + `asyncio.gather`) if publish latency becomes a real UX problem.
 - Condition validity is checked dynamically per category (`resolve_condition()`, see above) rather than
   trusting a static mapping, but `_CONDITION_ID_PREFERENCE` only covers the standard 1000-7000 conditionId
   sequence — category groups with additional non-standard IDs (fashion categories' 2990/3010 for "Pre-owned -

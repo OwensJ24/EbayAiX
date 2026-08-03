@@ -48,17 +48,19 @@ def load_supabase_storage_config() -> SupabaseStorageConfig:
     )
 
 
-def _object_path(upload_id: str) -> str:
-    # Every upload is normalized to JPEG at save time (see app.py's
-    # _validate_and_normalize_image), so this is always deterministic — nothing
-    # downstream ever needs to track or look up the original file extension.
-    return f"{upload_id}.jpg"
+def _object_path(upload_id: str, index: int) -> str:
+    # An item can have multiple photos (up to 10 — see app.py's /api/identify), each
+    # normalized to JPEG at save time (_validate_and_normalize_image), so a
+    # {upload_id}/{index}.jpg key is always deterministic — nothing downstream ever
+    # needs to track or look up the original file extension or a listing's photo count
+    # beyond what it's told (see PublishListingRequest.image_count in app.py).
+    return f"{upload_id}/{index}.jpg"
 
 
-def public_url(config: SupabaseStorageConfig, upload_id: str) -> str:
+def public_url(config: SupabaseStorageConfig, upload_id: str, index: int) -> str:
     """Deterministic — never checks whether the object actually exists. Assumes
-    upload_image() already succeeded earlier in the flow for this upload_id."""
-    return f"{config.url}/storage/v1/object/public/{config.bucket}/{_object_path(upload_id)}"
+    upload_image() already succeeded earlier in the flow for this upload_id/index."""
+    return f"{config.url}/storage/v1/object/public/{config.bucket}/{_object_path(upload_id, index)}"
 
 
 def _auth_headers(config: SupabaseStorageConfig) -> dict[str, str]:
@@ -68,12 +70,12 @@ def _auth_headers(config: SupabaseStorageConfig) -> dict[str, str]:
     }
 
 
-def upload_image(config: SupabaseStorageConfig, upload_id: str, contents: bytes) -> str:
+def upload_image(config: SupabaseStorageConfig, upload_id: str, index: int, contents: bytes) -> str:
     """Uploads image bytes, returns the public URL. The bucket must be configured as
     public (Supabase dashboard -> Storage -> the bucket -> toggle 'Public bucket') —
     this app has no way to set that via API; it's a one-time manual setup step.
     """
-    path = _object_path(upload_id)
+    path = _object_path(upload_id, index)
     headers = {
         **_auth_headers(config),
         "Content-Type": "image/jpeg",
@@ -84,24 +86,27 @@ def upload_image(config: SupabaseStorageConfig, upload_id: str, contents: bytes)
     response = httpx.post(url, headers=headers, content=contents, timeout=30.0)
     logger.info("Supabase upload response: status=%d body=%s", response.status_code, response.text[:500])
     response.raise_for_status()
-    result_url = public_url(config, upload_id)
+    result_url = public_url(config, upload_id, index)
     logger.info("Supabase public URL: %s", result_url)
     return result_url
 
 
-def delete_image(config: SupabaseStorageConfig, upload_id: str) -> None:
+def delete_images(config: SupabaseStorageConfig, upload_id: str, image_count: int) -> None:
     """Best-effort cleanup once a listing is published — failures are logged, not
     raised, since a lingering Supabase object is a much smaller problem than surfacing
-    an error to the user after publishing has already succeeded.
+    an error to the user after publishing has already succeeded. Nothing in this
+    codebase currently calls this (see the "never automatically deleted" note in
+    app.py's publish route) — kept as a usable utility, e.g. for a future manual
+    cleanup script.
     """
     try:
         response = httpx.request(
             "DELETE",
             f"{config.url}/storage/v1/object/{config.bucket}",
             headers={**_auth_headers(config), "Content-Type": "application/json"},
-            json={"prefixes": [_object_path(upload_id)]},
+            json={"prefixes": [_object_path(upload_id, i) for i in range(image_count)]},
             timeout=15.0,
         )
         response.raise_for_status()
     except httpx.HTTPError as e:
-        logger.info("delete_image degraded: %r", e)
+        logger.info("delete_images degraded: %r", e)

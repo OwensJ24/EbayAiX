@@ -42,11 +42,19 @@
       white-space: pre-wrap;
     }
 
-    #preview {
-      max-width: 100%;
-      max-height: 300px;
-      margin-top: 1rem;
+    #previewThumbs {
       display: none;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 1rem;
+    }
+
+    #previewThumbs img {
+      width: 100px;
+      height: 100px;
+      object-fit: cover;
+      border-radius: 6px;
+      border: 1px solid #ccc;
     }
 
     .error {
@@ -198,14 +206,16 @@
     </div>
   </details>
 
-  <p>Upload a photo of the item (JPEG/PNG/WEBP, up to 10MB).</p>
+  <p>Upload 1-10 photos of the item (JPEG/PNG/WEBP, up to 10MB each). All of them are
+    attached to the eBay listing; the first 5 are used for identification — include a
+    tag or label photo if it shows details like size that aren't visible elsewhere.</p>
 
   <div id="dropzone">
-    <p>Click to choose a file, or drag one here</p>
-    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" hidden>
+    <p>Click to choose photos, or drag them here</p>
+    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
   </div>
 
-  <img id="preview" alt="preview">
+  <div id="previewThumbs"></div>
   <div id="status"></div>
   <div id="confirmSection" style="display:none;">
     <p><strong>Confirm what this item is before analysis</strong> — the rest of the
@@ -237,6 +247,7 @@
     <label>Review and edit before publishing</label>
     <div class="listing-preview">
       <img id="previewListingImg" alt="listing image">
+      <p id="previewPhotoCount" style="font-size:0.85rem; color:#555; margin:0 0 0.5rem;"></p>
       <label for="editTitle">Title</label>
       <input type="text" id="editTitle" maxlength="80">
       <label for="editBrand">Brand</label>
@@ -276,9 +287,10 @@
 
   <script>
     const MAX_BYTES = 10 * 1024 * 1024;
+    const MAX_IMAGES = 10;
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
-    const preview = document.getElementById('preview');
+    const previewThumbsEl = document.getElementById('previewThumbs');
     const statusEl = document.getElementById('status');
     const confirmSection = document.getElementById('confirmSection');
     const confirmItemNameInput = document.getElementById('confirmItemNameInput');
@@ -296,6 +308,7 @@
     const draftStatusEl = document.getElementById('draftStatus');
     const previewSection = document.getElementById('previewSection');
     const previewListingImg = document.getElementById('previewListingImg');
+    const previewPhotoCountEl = document.getElementById('previewPhotoCount');
     const editTitle = document.getElementById('editTitle');
     const editBrand = document.getElementById('editBrand');
     const editCondition = document.getElementById('editCondition');
@@ -310,6 +323,8 @@
     const publishStatusEl = document.getElementById('publishStatus');
 
     let currentUploadId = null;
+    let currentImageCount = 0;
+    let currentPreviewThumbUrls = [];
     let currentIdentification = null;
     let currentDraftResult = null;
     let isUploading = false;
@@ -375,18 +390,16 @@
       e.preventDefault();
       dropzone.classList.remove('drag');
       if (isUploading) return;
-      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+      if (e.dataTransfer.files.length) handleFiles(Array.from(e.dataTransfer.files));
     });
     fileInput.addEventListener('change', () => {
       if (isUploading) return;
-      if (fileInput.files.length) handleFile(fileInput.files[0]);
+      if (fileInput.files.length) handleFiles(Array.from(fileInput.files));
     });
 
-    function handleFile(file) {
+    function handleFiles(files) {
       // Prevents piling up concurrent /api/identify requests (e.g. dragging several
-      // images in quick succession) — each one runs a memory-heavy local ResNet50
-      // inference pass, and running multiple at once was crashing the server with
-      // an out-of-memory error on Render's constrained free tier.
+      // batches of images in quick succession).
       if (isUploading) return;
 
       confirmSection.style.display = 'none';
@@ -403,19 +416,26 @@
       confirmPublishCheckbox.disabled = false;
       publishButton.disabled = true;
       currentUploadId = null;
+      currentImageCount = 0;
       currentIdentification = null;
       currentDraftResult = null;
 
-      if (file.size > MAX_BYTES) {
-        statusEl.innerHTML = `<p class="error">File is ${(file.size / 1024 / 1024).toFixed(1)}MB — max is 10MB.</p>`;
+      if (files.length > MAX_IMAGES) {
+        statusEl.innerHTML = `<p class="error">Up to ${MAX_IMAGES} photos are allowed — you selected ${files.length}.</p>`;
+        return;
+      }
+      const oversized = files.find((f) => f.size > MAX_BYTES);
+      if (oversized) {
+        statusEl.innerHTML = `<p class="error">"${escapeHtml(oversized.name)}" is ${(oversized.size / 1024 / 1024).toFixed(1)}MB — max is 10MB per photo.</p>`;
         return;
       }
 
-      preview.src = URL.createObjectURL(file);
-      preview.style.display = 'block';
+      currentPreviewThumbUrls = files.map((f) => URL.createObjectURL(f));
+      previewThumbsEl.innerHTML = currentPreviewThumbUrls.map((url) => `<img src="${url}" alt="item photo">`).join('');
+      previewThumbsEl.style.display = 'flex';
 
       const formData = new FormData();
-      formData.append('file', file);
+      files.forEach((f) => formData.append('file', f));
 
       isUploading = true;
       dropzone.classList.add('busy');
@@ -458,6 +478,7 @@
 
     function showConfirmStep(data) {
       currentUploadId = data.upload_id;
+      currentImageCount = data.image_count;
       currentIdentification = null;
       statusEl.innerHTML = '';
       confirmItemNameInput.value = data.item_name;
@@ -522,6 +543,7 @@
           item_name: itemName,
           category_id: categoryId,
           category_name: categoryName,
+          image_count: currentImageCount,
         }),
       })
         .then(async (res) => {
@@ -632,7 +654,10 @@
     // a draft is first created. Not called again after Save Changes, since at that point
     // the fields already show exactly what was just saved.
     function populateEditForm(identification, categoryQuery) {
-      previewListingImg.src = preview.src;
+      previewListingImg.src = currentPreviewThumbUrls[0] || '';
+      previewPhotoCountEl.textContent = currentImageCount > 1
+        ? `Showing photo 1 of ${currentImageCount} — all ${currentImageCount} will be attached to the listing.`
+        : '';
       editTitle.value = identification.item_name;
       editBrand.value = identification.brand || '';
       editCondition.value = identification.condition;
@@ -777,6 +802,7 @@
           price,
           weight_lbs: weightLbs,
           currency: 'USD',
+          image_count: currentImageCount,
         }),
       })
         .then(async (res) => {
