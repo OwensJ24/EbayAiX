@@ -512,7 +512,12 @@ def _sub(parent: ET.Element, tag: str, text: str | None = None) -> ET.Element:
 
 
 def _call_trading_api(config: EbayConfig, token: str, call_name: str, request_root: ET.Element) -> ET.Element:
-    body = ET.tostring(request_root, encoding="unicode")
+    # encoding="utf-8" (rather than "unicode") makes ET.tostring prepend the
+    # <?xml version='1.0' encoding='utf-8'?> declaration — required by eBay's Trading
+    # API gateway. Without it, eBay's internal XML->SOAP translation layer breaks and
+    # surfaces a generic, misleading SAXParseException about "soapenv:Body" instead of
+    # any error actually describing the missing declaration (confirmed live).
+    body = ET.tostring(request_root, encoding="utf-8", xml_declaration=True)
     headers = {
         "X-EBAY-API-SITEID": _SITE_ID,
         "X-EBAY-API-COMPATIBILITY-LEVEL": _TRADING_API_VERSION,
@@ -525,12 +530,12 @@ def _call_trading_api(config: EbayConfig, token: str, call_name: str, request_ro
         call_name,
         f"{config.api_base}/ws/api.dll",
         {k: v for k, v in headers.items() if k != "X-EBAY-API-IAF-TOKEN"},
-        body,
+        body.decode("utf-8"),
     )
     response = httpx.post(
         f"{config.api_base}/ws/api.dll",
         headers=headers,
-        content=body.encode("utf-8"),
+        content=body,
         timeout=30.0,
     )
     logger.info("%s response: status=%d body=%s", call_name, response.status_code, response.text[:3000])
