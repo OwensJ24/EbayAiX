@@ -33,21 +33,13 @@
   <div id="ebayStatus">Checking eBay connection…</div>
 
   <details id="locationSetup" style="margin-bottom:1.5rem;">
-    <summary style="cursor:pointer; font-size:0.9rem;">Set up eBay shipping location (one-time, required before publishing)</summary>
+    <summary style="cursor:pointer; font-size:0.9rem;">Set up shipping location (one-time, required before publishing)</summary>
     <div style="margin-top:0.75rem;">
-      <label for="locName">Location name</label>
-      <input type="text" id="locName" value="Main Location">
-      <label for="locAddressLine1">Address line 1 (optional)</label>
-      <input type="text" id="locAddressLine1" placeholder="123 Main St">
-      <label for="locCity">City</label>
-      <input type="text" id="locCity" placeholder="Columbus">
-      <label for="locState">State</label>
-      <input type="text" id="locState" placeholder="OH">
       <label for="locPostalCode">Postal code</label>
       <input type="text" id="locPostalCode" placeholder="43215">
       <label for="locCountry">Country</label>
       <input type="text" id="locCountry" value="US">
-      <button id="locationButton">Create Shipping Location</button>
+      <button id="locationButton">Save Shipping Location</button>
       <div id="locationStatus"></div>
     </div>
   </details>
@@ -113,8 +105,6 @@
     <button id="saveChangesButton">Save Changes</button>
     <div id="saveStatus"></div>
     <div class="warning" id="draftWarnings" style="display:none;"></div>
-    <p style="font-size:0.85rem;"><a href="#" id="verifyDraftLink">Verify draft via eBay API</a></p>
-    <div id="verifyResult"></div>
 
     <div class="publish-danger">
       <strong>Publishing makes this a real, live eBay listing.</strong> It becomes
@@ -160,8 +150,6 @@
     const saveChangesButton = document.getElementById('saveChangesButton');
     const saveStatusEl = document.getElementById('saveStatus');
     const draftWarningsEl = document.getElementById('draftWarnings');
-    const verifyDraftLink = document.getElementById('verifyDraftLink');
-    const verifyResultEl = document.getElementById('verifyResult');
     const confirmPublishCheckbox = document.getElementById('confirmPublish');
     const publishButton = document.getElementById('publishButton');
     const publishStatusEl = document.getElementById('publishStatus');
@@ -194,29 +182,20 @@
     const locationButton = document.getElementById('locationButton');
     const locationStatusEl = document.getElementById('locationStatus');
     locationButton.addEventListener('click', () => {
-      const city = document.getElementById('locCity').value.trim();
-      const state = document.getElementById('locState').value.trim();
       const postalCode = document.getElementById('locPostalCode').value.trim();
       const country = document.getElementById('locCountry').value.trim() || 'US';
-      if (!city || !state || !postalCode) {
-        locationStatusEl.innerHTML = '<p class="error">City, state, and postal code are required.</p>';
+      if (!postalCode) {
+        locationStatusEl.innerHTML = '<p class="error">Postal code is required.</p>';
         return;
       }
 
       locationButton.disabled = true;
-      locationStatusEl.textContent = 'Creating shipping location on eBay…';
+      locationStatusEl.textContent = 'Saving shipping location…';
 
       fetch('/api/ebay/location', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: document.getElementById('locName').value.trim() || 'Main Location',
-          address_line1: document.getElementById('locAddressLine1').value.trim() || null,
-          city,
-          state,
-          postal_code: postalCode,
-          country,
-        }),
+        body: JSON.stringify({ postal_code: postalCode, country }),
       })
         .then(async (res) => {
           const data = await res.json();
@@ -224,7 +203,7 @@
           return data;
         })
         .then(() => {
-          locationStatusEl.innerHTML = '<p>Shipping location created — future drafts will pick it up automatically.</p>';
+          locationStatusEl.innerHTML = '<p>Shipping location saved — future listings will use it automatically.</p>';
         })
         .catch((err) => {
           locationStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
@@ -265,7 +244,6 @@
       previewSection.style.display = 'none';
       publishStatusEl.innerHTML = '';
       saveStatusEl.innerHTML = '';
-      verifyResultEl.innerHTML = '';
       confirmPublishCheckbox.checked = false;
       confirmPublishCheckbox.disabled = false;
       publishButton.disabled = true;
@@ -444,6 +422,9 @@
     draftButton.addEventListener('click', () => {
       if (!currentIdentification || !currentUploadId) return;
 
+      // Price/weight aren't needed by this call (it only resolves category/condition/
+      // aspects/policies — nothing is created on eBay yet, see app.py), but validating
+      // them here still catches an empty field early, before the user gets to publish.
       const price = parseFloat(priceInput.value);
       if (!(price > 0)) {
         draftStatusEl.innerHTML = '<p class="error">Enter a price greater than 0.</p>';
@@ -456,12 +437,12 @@
       }
 
       draftButton.disabled = true;
-      draftStatusEl.textContent = 'Creating draft listing on eBay…';
+      draftStatusEl.textContent = 'Resolving category, condition, and item specifics…';
 
       fetch('/api/listing/draft', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identification: currentIdentification, upload_id: currentUploadId, price, weight_lbs: weightLbs }),
+        body: JSON.stringify({ identification: currentIdentification, upload_id: currentUploadId }),
       })
         .then(async (res) => {
           const data = await res.json();
@@ -470,7 +451,7 @@
         })
         .then((data) => {
           currentDraftResult = data.result;
-          draftStatusEl.innerHTML = `<p>Draft created — SKU <code>${escapeHtml(currentDraftResult.sku)}</code>, offer <code>${escapeHtml(currentDraftResult.offer_id)}</code>.</p>`;
+          draftStatusEl.innerHTML = '<p>Ready to review below.</p>';
           populateEditForm(currentIdentification, currentDraftResult.category_query);
           refreshDraftMeta(currentDraftResult);
           previewSection.style.display = 'block';
@@ -512,14 +493,15 @@
         aspectsDisplayEl.innerHTML = '';
       }
 
-      // category/merchant_location/listing_policies are each required by eBay to
-      // *publish* an offer (unlike creating/updating the draft/offer itself, which
-      // succeeds without them) — if any are missing, publishing is guaranteed to fail
-      // with a confusing eBay error (e.g. a mislabeled "Item.Country" error that
-      // actually means "no inventory location on this account"), so block it here.
+      // category/location/listing_policies are each required by eBay to *publish* a
+      // listing (unlike resolving the local draft preview, which succeeds without
+      // them) — if any are missing, publishing (AddFixedPriceItem) is guaranteed to
+      // fail, so block it here. Location is set via this app's own "Set up shipping
+      // location" form above; listing_policies still requires eBay's own Business
+      // Policies opt-in (Seller Hub only, not API-exposed).
       const canPublish = draftResult.missing.length === 0;
       if (!canPublish) {
-        draftWarningsEl.innerHTML = `<strong>Can't publish yet — finish these in eBay Seller Hub first, then come back:</strong><ul>${draftResult.notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
+        draftWarningsEl.innerHTML = `<strong>Can't publish yet — resolve these first, then come back:</strong><ul>${draftResult.notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
         draftWarningsEl.style.display = 'block';
       } else {
         draftWarningsEl.style.display = 'none';
@@ -528,6 +510,21 @@
       confirmPublishCheckbox.disabled = !canPublish;
       confirmPublishCheckbox.checked = false;
       publishButton.disabled = true;
+    }
+
+    // Builds a ProductIdentification from whatever's currently in the edit form —
+    // shared by Save Changes and Publish, so publish always sends exactly what's shown
+    // on screen rather than relying on the user having clicked Save Changes first.
+    function buildIdentificationFromForm() {
+      const title = editTitle.value.trim();
+      if (!title) return null;
+      return {
+        ...currentIdentification,
+        item_name: title,
+        brand: editBrand.value.trim() || null,
+        condition: editCondition.value,
+        content_description: editDescription.value,
+      };
     }
 
     saveChangesButton.addEventListener('click', () => {
@@ -543,32 +540,21 @@
         saveStatusEl.innerHTML = '<p class="error">Enter a package weight greater than 0.</p>';
         return;
       }
-      const title = editTitle.value.trim();
-      if (!title) {
+      const updatedIdentification = buildIdentificationFromForm();
+      if (!updatedIdentification) {
         saveStatusEl.innerHTML = '<p class="error">Title cannot be empty.</p>';
         return;
       }
 
-      const updatedIdentification = {
-        ...currentIdentification,
-        item_name: title,
-        brand: editBrand.value.trim() || null,
-        condition: editCondition.value,
-        content_description: editDescription.value,
-      };
-
       saveChangesButton.disabled = true;
-      saveStatusEl.textContent = 'Saving changes to eBay…';
+      saveStatusEl.textContent = 'Re-resolving category, condition, and item specifics…';
 
-      fetch(`/api/listing/draft/${currentDraftResult.offer_id}/update`, {
+      fetch(`/api/listing/draft/${currentUploadId}/update`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           identification: updatedIdentification,
           upload_id: currentUploadId,
-          sku: currentDraftResult.sku,
-          price,
-          weight_lbs: weightLbs,
           category_query: editCategoryQuery.value.trim() || null,
         }),
       })
@@ -592,36 +578,43 @@
         });
     });
 
-    verifyDraftLink.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (!currentDraftResult) return;
-      verifyResultEl.textContent = 'Fetching offer directly from eBay…';
-      fetch(`/api/listing/draft/${currentDraftResult.offer_id}`)
-        .then(async (res) => {
-          const verifyData = await res.json();
-          if (!res.ok) throw new Error(verifyData.detail || 'Request failed');
-          return verifyData;
-        })
-        .then((verifyData) => {
-          verifyResultEl.innerHTML = `<p>Confirmed — this is what eBay has on file:</p><pre>${JSON.stringify(verifyData.result, null, 2)}</pre>`;
-        })
-        .catch((err) => {
-          verifyResultEl.innerHTML = `<p class="error">${err.message}</p>`;
-        });
-    });
-
     confirmPublishCheckbox.addEventListener('change', () => {
       publishButton.disabled = !confirmPublishCheckbox.checked;
     });
 
     publishButton.addEventListener('click', () => {
-      if (!currentDraftResult || !confirmPublishCheckbox.checked) return;
+      if (!currentDraftResult || !currentUploadId || !confirmPublishCheckbox.checked) return;
+
+      const price = parseFloat(priceInput.value);
+      if (!(price > 0)) {
+        publishStatusEl.innerHTML = '<p class="error">Enter a price greater than 0.</p>';
+        return;
+      }
+      const weightLbs = parseFloat(weightInput.value);
+      if (!(weightLbs > 0)) {
+        publishStatusEl.innerHTML = '<p class="error">Enter a package weight greater than 0.</p>';
+        return;
+      }
+      const updatedIdentification = buildIdentificationFromForm();
+      if (!updatedIdentification) {
+        publishStatusEl.innerHTML = '<p class="error">Title cannot be empty.</p>';
+        return;
+      }
 
       publishButton.disabled = true;
       confirmPublishCheckbox.disabled = true;
       publishStatusEl.textContent = 'Publishing to eBay — this will make the listing live…';
 
-      fetch(`/api/listing/publish/${currentDraftResult.offer_id}`, { method: 'POST' })
+      fetch(`/api/listing/publish/${currentUploadId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identification: updatedIdentification,
+          price,
+          weight_lbs: weightLbs,
+          currency: 'USD',
+        }),
+      })
         .then(async (res) => {
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Request failed');

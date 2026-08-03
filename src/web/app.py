@@ -21,14 +21,8 @@ from pydantic import BaseModel
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, get_application_access_token, load_ebay_browse_config, search_comparable_listings
 from src.ebay.config import load_ebay_config
-from src.ebay.listing import (
-    create_draft_listing,
-    create_inventory_location,
-    get_offer,
-    publish_offer,
-    suggest_categories,
-    update_draft_listing,
-)
+from src.ebay.listing import EbayTradingApiError, create_listing, resolve_draft_listing, suggest_categories
+from src.ebay.seller_location import save_seller_location
 from src.ebay.token_store import get_valid_access_token
 from src.ml.vision_preprocessor import ClassificationResult, VisionPreprocessor
 from src.storage.supabase_storage import load_supabase_storage_config, public_url, upload_image
@@ -304,6 +298,11 @@ def _call_ebay(fn: Callable[..., T], *args, **kwargs) -> T:
         # load_ebay_config()/load_ebay_browse_config()/get_valid_access_token() raise
         # this for missing env vars or a not-yet-connected eBay account.
         raise HTTPException(status_code=400, detail=str(e))
+    except EbayTradingApiError as e:
+        # Trading API calls (AddFixedPriceItem) return HTTP 200 even on application
+        # failure — the real error signal is Ack=Failure in the body, which
+        # listing.py's _call_trading_api() already parses into this exception.
+        raise HTTPException(status_code=502, detail=f"eBay API error: {e}")
     except httpx.HTTPStatusError as e:
         request_id = (
             e.response.headers.get("X-EBAY-C-REQUEST-ID")
@@ -318,35 +317,18 @@ def _call_ebay(fn: Callable[..., T], *args, **kwargs) -> T:
         raise HTTPException(status_code=503, detail="Could not reach eBay's API. Please try again.")
 
 
-class InventoryLocationRequest(BaseModel):
-    city: str
-    state: str
-    postal_code: str
+class SellerLocationRequest(BaseModel):
     country: str = "US"
-    name: str = "Main Location"
-    address_line1: str | None = None
-    location_instructions: str | None = None
+    postal_code: str
 
 
 @app.post("/api/ebay/location")
-def create_inventory_location_route(payload: InventoryLocationRequest) -> dict:
-    """One-time account setup: registers a single merchant inventory location, which
-    eBay's Inventory API requires on every offer before it can be published (separate
-    from — and not automatically populated by — any 'ship-from' address configured
-    elsewhere in Seller Hub)."""
-    config = _call_ebay(load_ebay_config)
-    token = _call_ebay(get_valid_access_token, config)
-    address = {
-        "city": payload.city,
-        "stateOrProvince": payload.state,
-        "postalCode": payload.postal_code,
-        "country": payload.country,
-    }
-    if payload.address_line1:
-        address["addressLine1"] = payload.address_line1
-    _call_ebay(
-        create_inventory_location, config, token, address, payload.name, payload.location_instructions
-    )
+def save_seller_location_route(payload: SellerLocationRequest) -> dict:
+    """One-time account setup: saves the seller's ship-from country/postal code
+    locally. Trading API's AddFixedPriceItem needs only these two flat fields on the
+    item (Item.Country/Item.PostalCode) — unlike the old Inventory API, there's no
+    eBay-side location object to register at all, so this never calls eBay."""
+    save_seller_location(payload.country, payload.postal_code)
     return {"status": "complete"}
 
 
@@ -363,86 +345,61 @@ def price(identification: ProductIdentification) -> dict:
 class DraftListingRequest(BaseModel):
     identification: ProductIdentification
     upload_id: str
-    price: float
-    weight_lbs: float
-    currency: str = "USD"
 
 
 @app.post("/api/listing/draft")
-def create_draft_listing_route(payload: DraftListingRequest) -> dict:
-    # No local file access needed at all — the Supabase object was uploaded back in
-    # /api/identify, and its public URL is fully deterministic from upload_id.
-    storage_config = _call_storage(load_supabase_storage_config)
-    image_url = public_url(storage_config, payload.upload_id)
-    result = _call_ebay(
-        create_draft_listing,
-        payload.identification,
-        payload.upload_id,
-        image_url,
-        payload.price,
-        payload.weight_lbs,
-        payload.currency,
-    )
+def resolve_draft_listing_route(payload: DraftListingRequest) -> dict:
+    """Resolves category/condition/aspects/policies and reports what's included vs.
+    missing — a read-only dry run, not a real eBay write. Trading API's
+    AddFixedPriceItem has no draft/unpublished state (see src/ebay/listing.py's module
+    docstring), so nothing is created on eBay until the explicit Publish click below."""
+    result = _call_ebay(resolve_draft_listing, payload.identification)
     return {"status": "complete", "result": result.model_dump()}
 
 
 class UpdateDraftListingRequest(BaseModel):
     identification: ProductIdentification
     upload_id: str
-    sku: str
-    price: float
-    weight_lbs: float
-    currency: str = "USD"
     category_query: str | None = None
 
 
-@app.post("/api/listing/draft/{offer_id}/update")
-def update_draft_listing_route(offer_id: str, payload: UpdateDraftListingRequest) -> dict:
-    """Applies edits made in the review screen (title/brand/condition/description/
-    category/price/weight) to the already-created draft, in place — the automatic
-    identification and category suggestion can be wrong, and this is the human's chance
-    to fix it before publishing."""
+@app.post("/api/listing/draft/{upload_id}/update")
+def update_draft_listing_route(upload_id: str, payload: UpdateDraftListingRequest) -> dict:
+    """Re-resolves after edits made in the review screen (title/brand/condition/
+    description/category) — same read-only dry run as above, just re-run with the
+    edited fields. `upload_id` in the path is purely for URL readability; nothing is
+    looked up by it since there's no eBay object to reference before publish."""
+    result = _call_ebay(resolve_draft_listing, payload.identification, payload.category_query)
+    return {"status": "complete", "result": result.model_dump()}
+
+
+class PublishListingRequest(BaseModel):
+    identification: ProductIdentification
+    price: float
+    weight_lbs: float
+    currency: str = "USD"
+
+
+@app.post("/api/listing/publish/{upload_id}")
+def publish_listing_route(upload_id: str, payload: PublishListingRequest) -> dict:
+    """Make a real, live, publicly purchasable eBay listing — the one and only eBay
+    write in the whole flow (see create_listing()'s docstring). This app's own
+    listing-preview screen is the Human-in-the-Loop review step, since eBay has no
+    unpublished state to review beforehand; this route is only ever called from an
+    explicit user click after that review, never automatically."""
     storage_config = _call_storage(load_supabase_storage_config)
-    image_url = public_url(storage_config, payload.upload_id)
+    image_url = public_url(storage_config, upload_id)
     result = _call_ebay(
-        update_draft_listing,
-        offer_id,
-        payload.sku,
+        create_listing,
         payload.identification,
+        upload_id,
         image_url,
         payload.price,
         payload.weight_lbs,
         payload.currency,
-        1,
-        payload.category_query,
     )
-    return {"status": "complete", "result": result.model_dump()}
-
-
-@app.get("/api/listing/draft/{offer_id}")
-def get_draft_listing_route(offer_id: str) -> dict:
-    """Fetch a created draft straight from eBay's API — a reliable way to confirm
-    it exists without depending on eBay's sandbox Seller Hub web UI, which is known
-    to be far less complete/reliable than production's."""
-    config = _call_ebay(load_ebay_config)
-    token = _call_ebay(get_valid_access_token, config)
-    offer = _call_ebay(get_offer, config, token, offer_id)
-    return {"status": "complete", "result": offer}
-
-
-@app.post("/api/listing/publish/{offer_id}")
-def publish_offer_route(offer_id: str) -> dict:
-    """Make a previously-created draft offer live and publicly purchasable on
-    eBay. eBay's Seller Hub has no view for API-created unpublished offers, so
-    this app's own listing-preview screen is the Human-in-the-Loop review step
-    for this action — this route is only ever called from an explicit user
-    click after that review, never automatically."""
-    config = _call_ebay(load_ebay_config)
-    token = _call_ebay(get_valid_access_token, config)
-    result = _call_ebay(publish_offer, config, token, offer_id)
     # Deliberately NOT deleting the Supabase image here, even though eBay has by this
-    # point confirmed the listing is live. publishOffer returning success doesn't mean
-    # eBay has actually fetched imageUrls yet — that fetch is lazy/asynchronous (the
+    # point confirmed the listing is live. eBay's image fetch is lazy/asynchronous (the
     # same reasoning behind the original "image not available" bug), so there's no
     # reliable point at which deleting the source image is provably safe. Leaving it in
     # Supabase permanently is the same accepted tradeoff this codebase already makes for

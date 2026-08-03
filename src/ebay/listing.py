@@ -1,22 +1,31 @@
-"""eBay Inventory + Offer APIs: create a draft listing, then optionally publish it.
+"""eBay Trading API: create a real, live listing in a single call.
 
-Flow: createOrReplaceInventoryItem -> best-effort category/location/policy
-enrichment -> createOffer -> (separate, explicit step) publishOffer.
+Flow: best-effort category/condition/aspects/policy resolution (all read-only REST
+Taxonomy/Metadata/Account API calls, no eBay writes) -> a single AddFixedPriceItem
+call, the only write in this module.
 
-eBay's own Seller Hub has no UI at all for reviewing an unpublished offer
-created via the Inventory API (confirmed via eBay developer community
-research) — so the Human-in-the-Loop safety gate for this project lives in
-our own app instead: the frontend shows a full preview of everything that
-will go into the listing, and only an explicit user action calls
-`publish_offer()`. That function is the only place in this codebase that
-calls eBay's publishOffer endpoint, and it makes the listing genuinely live
-and publicly purchasable — not a reversible/staging action.
+**Why the Trading API and not the newer Inventory API this project used before:**
+listings created via the Inventory API (createOrReplaceInventoryItem + createOffer +
+publishOffer) cannot be edited in eBay's own mobile app afterward — confirmed by real
+account testing, not a hypothetical. The Trading API doesn't have this limitation.
+
+**Why there's no "draft" object on eBay anymore:** unlike createOffer/publishOffer's
+two-step create-then-publish, Trading API's AddFixedPriceItem has no unpublished state
+at all — a successful call goes immediately live (confirmed against eBay's own docs and
+developer community, not assumed). Since eBay's Seller Hub already couldn't show
+Inventory-API drafts either, this app's own frontend was already the real
+Human-in-the-Loop review surface — that doesn't change. What changes is that the
+review/edit screen is now entirely local (no eBay object exists to create or update
+before publish); the explicit, checkbox-gated Publish click is the one and only time
+this module ever writes to eBay at all. That's a *stronger* safety guarantee than
+before, not a weaker one.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import xml.etree.ElementTree as ET
 
 import httpx
 from pydantic import BaseModel
@@ -24,6 +33,7 @@ from pydantic import BaseModel
 from src.agents.vision_subagent import ProductIdentification
 from src.ebay.browse import build_query
 from src.ebay.config import EbayConfig, load_ebay_config
+from src.ebay.seller_location import SellerLocation, load_seller_location
 from src.ebay.token_store import get_valid_access_token
 
 logger = logging.getLogger(__name__)
@@ -31,57 +41,39 @@ logger = logging.getLogger(__name__)
 _MARKETPLACE_ID = "EBAY_US"
 _CATEGORY_TREE_ID = "0"  # EBAY_US
 
+# eBay's legacy numeric ConditionID — this IS what Trading API's Item.ConditionID field
+# wants directly, no enum translation layer needed (unlike the REST Inventory API's
+# ConditionEnum strings this project used before). Confirmed against eBay's own
+# condition-ID reference and community sources.
 _CONDITION_MAP: dict[str, str] = {
-    "New": "NEW",
-    "Like New": "LIKE_NEW",
-    "Very Good": "USED_VERY_GOOD",
-    "Good": "USED_GOOD",
-    "Acceptable": "USED_ACCEPTABLE",
-    "For Parts": "FOR_PARTS_OR_NOT_WORKING",
+    "New": "1000",
+    "Like New": "2750",
+    "Very Good": "4000",
+    "Good": "5000",
+    "Acceptable": "6000",
+    "For Parts": "7000",
 }
 
-# eBay's legacy numeric conditionId (as returned by get_item_condition_policies below) ->
-# the ConditionEnum string the Inventory API's `condition` field actually expects. This
-# table is fixed/global — what varies per category is *which* subset of these IDs a given
-# category allows (e.g. Headphones only allows New/Open-box/Used/For-parts, not our full
-# 6-tier scale) — confirmed against eBay's own condition-ID reference and community
-# sources. Category groups with additional non-standard IDs (fashion categories' 2990/3010
-# for "Pre-owned - Excellent/Fair", observed live but not independently confirmed here)
-# aren't covered — those categories fall through to the best-effort guess below.
-_CONDITION_ID_TO_ENUM: dict[str, str] = {
-    "1000": "NEW",
-    "1500": "NEW_OTHER",
-    "1750": "NEW_WITH_DEFECTS",
-    "2000": "CERTIFIED_REFURBISHED",
-    "2500": "SELLER_REFURBISHED",
-    "2750": "LIKE_NEW",
-    "3000": "USED_EXCELLENT",
-    "4000": "USED_VERY_GOOD",
-    "5000": "USED_GOOD",
-    "6000": "USED_ACCEPTABLE",
-    "7000": "FOR_PARTS_OR_NOT_WORKING",
-}
-
-# For each of our own condition labels, ConditionEnum candidates in closest-first order —
+# For each of our own condition labels, ConditionID candidates in closest-first order —
 # used to pick the nearest eBay-allowed condition for a category when _CONDITION_MAP's
-# default guess isn't one of that category's allowed conditions.
-_CONDITION_ENUM_PREFERENCE: dict[str, tuple[str, ...]] = {
-    "New": ("NEW", "CERTIFIED_REFURBISHED", "NEW_OTHER"),
-    "Like New": ("LIKE_NEW", "USED_EXCELLENT", "NEW_OTHER", "SELLER_REFURBISHED"),
-    "Very Good": ("USED_VERY_GOOD", "USED_EXCELLENT", "LIKE_NEW"),
-    "Good": ("USED_GOOD", "USED_VERY_GOOD", "USED_EXCELLENT"),
-    "Acceptable": ("USED_ACCEPTABLE", "USED_GOOD", "USED_VERY_GOOD", "USED_EXCELLENT"),
-    "For Parts": ("FOR_PARTS_OR_NOT_WORKING", "USED_ACCEPTABLE"),
+# default guess isn't one of that category's allowed conditions (categories restrict
+# which IDs are valid — e.g. Headphones only allows New/Open-box/Used/For-parts, not
+# our full 6-tier scale — sending a disallowed one fails with errorId 25021).
+_CONDITION_ID_PREFERENCE: dict[str, tuple[str, ...]] = {
+    "New": ("1000", "2000", "1500"),
+    "Like New": ("2750", "3000", "1500", "2500"),
+    "Very Good": ("4000", "3000", "2750"),
+    "Good": ("5000", "4000", "3000"),
+    "Acceptable": ("6000", "5000", "4000", "3000"),
+    "For Parts": ("7000", "6000"),
 }
 
 
 def _auth_headers(token: str) -> dict[str, str]:
-    # Content-Language is required on every Sell Inventory API call that writes data
-    # (createOrReplaceInventoryItem AND createOffer) — eBay's error for a *missing*
-    # Content-Language header confusingly says "Invalid value for header
-    # Content-Language" (error 25709) rather than something like "header required",
-    # which is what sent us chasing the wrong call and the wrong fix at first.
-    # Applying it to every call (including GETs, which ignore it) is simplest and safe.
+    # Used only for the REST Taxonomy/Metadata/Account calls below (category
+    # suggestions, condition policies, required aspects, business policies) — all
+    # read-only, independent of Inventory vs. Trading API. Content-Language is required
+    # on every Sell API call that writes data; harmless on GETs, so applied uniformly.
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -103,64 +95,6 @@ def _build_description(identification: ProductIdentification) -> str:
     body = identification.content_description.strip()
     full_description = f"{identification.item_name}\n\n{body}" if body else identification.item_name
     return full_description[:4000]
-
-
-def _build_inventory_item_payload(
-    identification: ProductIdentification,
-    image_url: str,
-    quantity: int,
-    condition_enum: str,
-    aspects: dict[str, list[str]],
-    weight_lbs: float,
-) -> dict:
-    payload = {
-        "condition": condition_enum,
-        "product": {
-            "title": identification.item_name[:80],
-            "description": _build_description(identification),
-            "imageUrls": [image_url],
-        },
-        "packageWeightAndSize": {"weight": {"value": weight_lbs, "unit": "POUND"}},
-        "availability": {"shipToLocationAvailability": {"quantity": quantity}},
-    }
-    if aspects:
-        payload["product"]["aspects"] = aspects
-    return payload
-
-
-def create_or_replace_inventory_item(
-    config: EbayConfig,
-    token: str,
-    sku: str,
-    identification: ProductIdentification,
-    image_url: str,
-    condition_enum: str,
-    aspects: dict[str, list[str]],
-    weight_lbs: float,
-    quantity: int = 1,
-) -> None:
-    payload = _build_inventory_item_payload(identification, image_url, quantity, condition_enum, aspects, weight_lbs)
-    headers = _auth_headers(token)
-
-    logger.info(
-        "createOrReplaceInventoryItem request: url=%s headers=%s payload=%s",
-        f"{config.api_base}/sell/inventory/v1/inventory_item/{sku}",
-        {k: v for k, v in headers.items() if k != "Authorization"},
-        payload,
-    )
-    response = httpx.put(
-        f"{config.api_base}/sell/inventory/v1/inventory_item/{sku}",
-        headers=headers,
-        json=payload,
-        timeout=20.0,
-    )
-    logger.info(
-        "createOrReplaceInventoryItem response: status=%d headers=%s body=%s",
-        response.status_code,
-        dict(response.headers),
-        response.text,
-    )
-    response.raise_for_status()
 
 
 def suggest_category_id(config: EbayConfig, token: str, query: str) -> str | None:
@@ -226,18 +160,13 @@ def suggest_categories(config: EbayConfig, token: str, query: str, limit: int = 
         return []
 
 
-def resolve_condition(
-    config: EbayConfig, token: str, category_id: str | None, condition: str
-) -> tuple[str, bool]:
-    """Picks a ConditionEnum for `condition` that eBay's Metadata API confirms is valid
-    for `category_id`. Returns (enum, confirmed) — falls back to the static
-    _CONDITION_MAP guess with confirmed=False when there's no category, the lookup
-    fails, or none of our own candidates are in that category's allowed set (e.g.
-    fashion categories using non-standard conditionIds we don't have a mapping for).
-    This exists because eBay categories restrict which conditions are valid — e.g.
-    Headphones only allows New/Open-box/Used/For-parts, not our full 6-tier scale —
-    and sending a disallowed one fails with errorId 25021 ("invalid for the selected
-    primary category id").
+def resolve_condition(config: EbayConfig, token: str, category_id: str | None, condition: str) -> tuple[str, bool]:
+    """Picks a numeric eBay ConditionID for `condition` that eBay's Metadata API
+    confirms is valid for `category_id`. Returns (condition_id, confirmed) — falls back
+    to the static _CONDITION_MAP guess with confirmed=False when there's no category,
+    the lookup fails, or none of our own candidates are in that category's allowed set
+    (e.g. fashion categories using non-standard conditionIds like 2990/3010 we don't
+    have in our preference table).
     """
     default = _CONDITION_MAP[condition]
     if not category_id:
@@ -261,14 +190,13 @@ def resolve_condition(
             return default, False
 
         allowed_ids = {c["conditionId"] for c in policies[0].get("itemConditions", [])}
-        allowed_enums = {_CONDITION_ID_TO_ENUM[cid] for cid in allowed_ids if cid in _CONDITION_ID_TO_ENUM}
-        for candidate in _CONDITION_ENUM_PREFERENCE[condition]:
-            if candidate in allowed_enums:
+        for candidate in _CONDITION_ID_PREFERENCE[condition]:
+            if candidate in allowed_ids:
                 return candidate, True
 
         logger.info(
             "resolve_condition degraded: none of %s allowed for category=%s (allowed ids=%s)",
-            _CONDITION_ENUM_PREFERENCE[condition],
+            _CONDITION_ID_PREFERENCE[condition],
             category_id,
             allowed_ids,
         )
@@ -382,78 +310,6 @@ def resolve_aspects(
     return aspects, unresolved
 
 
-def get_merchant_location_key(config: EbayConfig, token: str) -> str | None:
-    try:
-        response = httpx.get(
-            f"{config.api_base}/sell/inventory/v1/location",
-            headers=_auth_headers(token),
-            params={"limit": 1},
-            timeout=15.0,
-        )
-        logger.info(
-            "get_merchant_location_key response: status=%d body=%s",
-            response.status_code,
-            response.text,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if data.get("total", 0) < 1:
-            logger.info("get_merchant_location_key degraded: account reports zero inventory locations")
-            return None
-        return data["locations"][0]["merchantLocationKey"]
-    except httpx.HTTPStatusError as e:
-        logger.info("get_merchant_location_key degraded: %d %s", e.response.status_code, e.response.text[:300])
-        return None
-    except (httpx.HTTPError, KeyError, IndexError) as e:
-        logger.info("get_merchant_location_key degraded: %r", e)
-        return None
-
-
-# One-time setup: a single merchant location, shared by every draft this app creates.
-# This is a single-seller portfolio app, so one fixed key (rather than a per-listing or
-# user-chosen one) is deliberate — create_inventory_location() is only ever meant to be
-# called once per eBay account, from the frontend's "Set up shipping location" form.
-DEFAULT_MERCHANT_LOCATION_KEY = "agentx-default-location"
-
-
-def create_inventory_location(
-    config: EbayConfig,
-    token: str,
-    address: dict[str, str],
-    name: str = "Main Location",
-    location_instructions: str | None = None,
-    merchant_location_key: str = DEFAULT_MERCHANT_LOCATION_KEY,
-) -> None:
-    payload: dict = {
-        "location": {"address": address},
-        "name": name,
-        "merchantLocationStatus": "ENABLED",
-        "locationTypes": ["WAREHOUSE"],
-    }
-    if location_instructions:
-        payload["locationInstructions"] = location_instructions
-
-    headers = _auth_headers(token)
-    logger.info(
-        "createInventoryLocation request: url=%s payload=%s",
-        f"{config.api_base}/sell/inventory/v1/location/{merchant_location_key}",
-        payload,
-    )
-    response = httpx.post(
-        f"{config.api_base}/sell/inventory/v1/location/{merchant_location_key}",
-        headers=headers,
-        json=payload,
-        timeout=20.0,
-    )
-    logger.info(
-        "createInventoryLocation response: status=%d headers=%s body=%s",
-        response.status_code,
-        dict(response.headers),
-        response.text,
-    )
-    response.raise_for_status()
-
-
 _POLICY_ENDPOINTS = {
     "fulfillmentPolicyId": ("fulfillment_policy", "fulfillmentPolicies", "fulfillmentPolicyId"),
     "paymentPolicyId": ("payment_policy", "paymentPolicies", "paymentPolicyId"),
@@ -482,129 +338,10 @@ def get_listing_policies(config: EbayConfig, token: str) -> dict[str, str]:
     return policies
 
 
-def _build_offer_payload(
-    sku: str,
-    price: float,
-    currency: str,
-    quantity: int,
-    category_id: str | None,
-    merchant_location_key: str | None,
-    listing_policies: dict[str, str],
-) -> dict:
-    payload = {
-        "sku": sku,
-        "marketplaceId": _MARKETPLACE_ID,
-        "format": "FIXED_PRICE",
-        "availableQuantity": quantity,
-        "pricingSummary": {"price": {"value": f"{price:.2f}", "currency": currency}},
-    }
-    if category_id:
-        payload["categoryId"] = category_id
-    if merchant_location_key:
-        payload["merchantLocationKey"] = merchant_location_key
-    if listing_policies:
-        payload["listingPolicies"] = listing_policies
-    return payload
-
-
-def create_offer(
-    config: EbayConfig,
-    token: str,
-    sku: str,
-    price: float,
-    currency: str,
-    quantity: int,
-    category_id: str | None,
-    merchant_location_key: str | None,
-    listing_policies: dict[str, str],
-) -> str:
-    payload = _build_offer_payload(sku, price, currency, quantity, category_id, merchant_location_key, listing_policies)
-    logger.info("createOffer request: url=%s payload=%s", f"{config.api_base}/sell/inventory/v1/offer", payload)
-    response = httpx.post(
-        f"{config.api_base}/sell/inventory/v1/offer",
-        headers=_auth_headers(token),
-        json=payload,
-        timeout=20.0,
-    )
-    logger.info(
-        "createOffer response: status=%d headers=%s body=%s",
-        response.status_code,
-        dict(response.headers),
-        response.text,
-    )
-    response.raise_for_status()
-    return response.json()["offerId"]
-
-
-def update_offer(
-    config: EbayConfig,
-    token: str,
-    offer_id: str,
-    sku: str,
-    price: float,
-    currency: str,
-    quantity: int,
-    category_id: str | None,
-    merchant_location_key: str | None,
-    listing_policies: dict[str, str],
-) -> None:
-    """Updates an already-created (unpublished) offer in place — eBay's updateOffer is a
-    full replacement PUT (like createOrReplaceInventoryItem), not a partial patch, so
-    this rebuilds the whole payload fresh rather than merging with the existing offer.
-    Safe to call on a category change since the offer is still unpublished; changing
-    category on an already-*published* listing is a different, unsupported operation
-    this codebase doesn't attempt.
-    """
-    payload = _build_offer_payload(sku, price, currency, quantity, category_id, merchant_location_key, listing_policies)
-    logger.info(
-        "updateOffer request: url=%s payload=%s", f"{config.api_base}/sell/inventory/v1/offer/{offer_id}", payload
-    )
-    response = httpx.put(
-        f"{config.api_base}/sell/inventory/v1/offer/{offer_id}",
-        headers=_auth_headers(token),
-        json=payload,
-        timeout=20.0,
-    )
-    logger.info(
-        "updateOffer response: status=%d headers=%s body=%s",
-        response.status_code,
-        dict(response.headers),
-        response.text,
-    )
-    response.raise_for_status()
-
-
-def get_offer(config: EbayConfig, token: str, offer_id: str) -> dict:
-    """Fetch a previously-created offer directly from eBay's API.
-
-    Useful for verifying a draft actually exists without relying on eBay's
-    sandbox Seller Hub web UI, which is known to be far less reliable than
-    production's.
-    """
-    response = httpx.get(
-        f"{config.api_base}/sell/inventory/v1/offer/{offer_id}",
-        headers=_auth_headers(token),
-        timeout=15.0,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-class DraftListingResult(BaseModel):
-    sku: str
-    offer_id: str
-    included: list[str]
-    missing: list[str]
-    notes: list[str]
-    aspects: dict[str, list[str]] = {}
-    category_query: str = ""
-
-
 class _ResolvedListingData(BaseModel):
     category_id: str | None
-    condition_enum: str
+    condition_id: str
     aspects: dict[str, list[str]]
-    merchant_location_key: str | None
     listing_policies: dict[str, str]
     included: list[str]
     missing: list[str]
@@ -618,11 +355,12 @@ def _resolve_listing_data(
     query: str,
     category_id_override: str | None = None,
 ) -> _ResolvedListingData:
-    """Shared by create_draft_listing() and update_draft_listing(): resolves
-    category/condition/aspects/location/policies from `identification` and the given
-    category search query. Raises RuntimeError for a genuinely unresolvable required
-    aspect (see resolve_aspects) — fails fast rather than letting a guaranteed eBay
-    rejection happen downstream.
+    """Shared by the pre-publish preview/edit routes and the final publish call:
+    resolves category/condition/aspects/policies from `identification` and the given
+    category search query. Every call this function makes is a read-only REST GET
+    (Taxonomy/Metadata/Account APIs) — it never writes anything to eBay. Raises
+    RuntimeError for a genuinely unresolvable required aspect (see resolve_aspects) —
+    fails fast rather than letting a guaranteed eBay rejection happen at publish time.
 
     `category_id_override`, when given, skips the Taxonomy suggestion call entirely —
     used when the user already confirmed a real category via the identify/confirm step
@@ -632,10 +370,6 @@ def _resolve_listing_data(
     missing: list[str] = []
     notes: list[str] = []
 
-    # Category must be known before the inventory item is built, since the item's
-    # condition/aspects have to already be ones this category allows — eBay validates
-    # condition-vs-category and required-aspects downstream and rejects mismatches with
-    # cryptic errors (25021, 25002), so resolving this first minimizes those round-trips.
     if category_id_override:
         category_id = category_id_override
         included.append("category")
@@ -647,11 +381,11 @@ def _resolve_listing_data(
             missing.append("category")
             notes.append("No eBay category suggestion found — try more specific category search terms.")
 
-    condition_enum, condition_confirmed = resolve_condition(config, token, category_id, identification.condition)
+    condition_id, condition_confirmed = resolve_condition(config, token, category_id, identification.condition)
     if category_id and not condition_confirmed:
         notes.append(
             f"Couldn't confirm '{identification.condition}' is a valid eBay condition for the detected "
-            f"category — used a best-effort guess ({condition_enum}); double-check it before publishing."
+            f"category — used a best-effort guess; double-check it before publishing."
         )
 
     aspects: dict[str, list[str]] = {}
@@ -659,29 +393,17 @@ def _resolve_listing_data(
         required_aspects = get_required_aspects(config, token, category_id)
         aspects, unresolved_aspects = resolve_aspects(identification, required_aspects)
         if unresolved_aspects:
-            # Unlike merchant_location/listing_policies (only required to *publish*),
-            # eBay validates item specifics when the offer/inventory item is created —
-            # letting this through would just fail moments later with the same cryptic
-            # errorId 25002 this whole function exists to avoid. Fail fast with a clear
-            # message instead of spending an eBay round-trip on a guaranteed rejection.
-            # Note: this can't be fixed in Seller Hub either — Seller Hub has no view
-            # into an unpublished offer at all (see module docstring).
+            # eBay validates item specifics when the listing is created — letting this
+            # through would just fail moments later with the same cryptic errorId 25002
+            # this whole function exists to avoid. Fail fast with a clear message
+            # instead of spending an eBay round-trip on a guaranteed rejection.
             raise RuntimeError(
                 "eBay requires a value for these item specifics in the detected category, and it "
                 f"couldn't be determined automatically: {', '.join(unresolved_aspects)}. Try editing the "
                 "title/description with more detail, or a more specific category search."
             )
     elif identification.brand:
-        # No category means no aspect requirements are known at all — still send Brand
-        # since we have it and it's almost always accepted regardless of category.
         aspects = {"Brand": [identification.brand]}
-
-    merchant_location_key = get_merchant_location_key(config, token)
-    if merchant_location_key:
-        included.append("merchant_location")
-    else:
-        missing.append("merchant_location")
-        notes.append("No shipping location set up on this eBay account — add one in Seller Hub before publishing.")
 
     listing_policies = get_listing_policies(config, token)
     if len(listing_policies) == 3:
@@ -694,11 +416,16 @@ def _resolve_listing_data(
             "/ebay/connect to enable policy detection). Add them in Seller Hub before publishing."
         )
 
+    if load_seller_location() is None:
+        missing.append("location")
+        notes.append("No shipping location saved yet — set one up above before publishing.")
+    else:
+        included.append("location")
+
     return _ResolvedListingData(
         category_id=category_id,
-        condition_enum=condition_enum,
+        condition_id=condition_id,
         aspects=aspects,
-        merchant_location_key=merchant_location_key,
         listing_policies=listing_policies,
         included=included,
         missing=missing,
@@ -706,7 +433,198 @@ def _resolve_listing_data(
     )
 
 
-def create_draft_listing(
+class DraftListingResult(BaseModel):
+    included: list[str]
+    missing: list[str]
+    notes: list[str]
+    aspects: dict[str, list[str]] = {}
+    category_query: str = ""
+
+
+def resolve_draft_listing(
+    identification: ProductIdentification,
+    category_query: str | None = None,
+) -> DraftListingResult:
+    """The pre-publish preview/edit step — resolves category/condition/aspects/policies
+    and reports what's included vs. missing, exactly like before, but calls nothing on
+    eBay that writes data. There's no draft object to create or update anymore (Trading
+    API's AddFixedPriceItem has no unpublished state — see module docstring), so this
+    is purely a read-only dry run that feeds the review screen.
+    """
+    config = load_ebay_config()
+    token = get_valid_access_token(config)
+
+    if category_query:
+        query = category_query
+        category_id_override = None
+    else:
+        query = build_query(identification)
+        category_id_override = identification.category_id
+
+    data = _resolve_listing_data(config, token, identification, query, category_id_override=category_id_override)
+
+    return DraftListingResult(
+        included=data.included,
+        missing=data.missing,
+        notes=data.notes,
+        aspects=data.aspects,
+        category_query=query,
+    )
+
+
+def _listing_url(config: EbayConfig, item_id: str) -> str:
+    base = "https://www.sandbox.ebay.com" if config.environment == "sandbox" else "https://www.ebay.com"
+    return f"{base}/itm/{item_id}"
+
+
+_EB_NS_URI = "urn:ebay:apis:eBLBaseComponents"
+_NS = {"eb": _EB_NS_URI}
+# eBay's Trading API release version this app builds requests against — check
+# https://developer.ebay.com/devzone/xml/docs/ReleaseNotes.html for the current value
+# and bump this if a call starts failing with a version-related error.
+_TRADING_API_VERSION = "1155"
+_SITE_ID = "0"  # EBAY_US
+
+
+class EbayTradingApiError(Exception):
+    """Raised when a Trading API call returns Ack=Failure (or an applicable Warning).
+    Trading API returns HTTP 200 even for these — the real success/failure signal is
+    the <Ack> element in the response body, not the HTTP status code, so
+    response.raise_for_status() alone would silently treat a rejected listing as a
+    success.
+    """
+
+    def __init__(self, errors: list[dict[str, str | None]]):
+        self.errors = errors
+        message = "; ".join(f"[{e.get('code')}] {e.get('message')}" for e in errors) or "eBay Trading API call failed"
+        super().__init__(message)
+
+
+def _sub(parent: ET.Element, tag: str, text: str | None = None) -> ET.Element:
+    """SubElement shorthand. ElementTree escapes text content automatically — unlike a
+    hand-rolled string template, which would silently produce invalid XML for titles or
+    category names containing &, <, or > (all seen in this project's own real data,
+    e.g. "Portable Audio & Headphones")."""
+    el = ET.SubElement(parent, tag)
+    if text is not None:
+        el.text = text
+    return el
+
+
+def _call_trading_api(config: EbayConfig, token: str, call_name: str, request_root: ET.Element) -> ET.Element:
+    body = ET.tostring(request_root, encoding="unicode")
+    headers = {
+        "X-EBAY-API-SITEID": _SITE_ID,
+        "X-EBAY-API-COMPATIBILITY-LEVEL": _TRADING_API_VERSION,
+        "X-EBAY-API-CALL-NAME": call_name,
+        "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml",
+    }
+    logger.info(
+        "%s request: url=%s headers=%s body=%s",
+        call_name,
+        f"{config.api_base}/ws/api.dll",
+        {k: v for k, v in headers.items() if k != "X-EBAY-API-IAF-TOKEN"},
+        body,
+    )
+    response = httpx.post(
+        f"{config.api_base}/ws/api.dll",
+        headers=headers,
+        content=body.encode("utf-8"),
+        timeout=30.0,
+    )
+    logger.info("%s response: status=%d body=%s", call_name, response.status_code, response.text[:3000])
+    response.raise_for_status()  # still catches real HTTP/network-level failures
+
+    root = ET.fromstring(response.text)
+    ack = root.findtext("eb:Ack", namespaces=_NS)
+    if ack in ("Failure", "PartialFailure"):
+        errors = [
+            {
+                "code": err.findtext("eb:ErrorCode", namespaces=_NS),
+                "message": (
+                    err.findtext("eb:LongMessage", namespaces=_NS)
+                    or err.findtext("eb:ShortMessage", namespaces=_NS)
+                ),
+            }
+            for err in root.findall("eb:Errors", namespaces=_NS)
+        ]
+        raise EbayTradingApiError(errors)
+    return root
+
+
+def _build_add_fixed_price_item_request(
+    identification: ProductIdentification,
+    image_url: str,
+    price: float,
+    weight_lbs: float,
+    currency: str,
+    quantity: int,
+    data: _ResolvedListingData,
+    location: SellerLocation,
+    sku: str,
+) -> ET.Element:
+    ET.register_namespace("", _EB_NS_URI)
+    root = ET.Element(f"{{{_EB_NS_URI}}}AddFixedPriceItemRequest")
+    _sub(root, "ErrorLanguage", "en_US")
+    _sub(root, "WarningLevel", "High")
+
+    item = _sub(root, "Item")
+    _sub(item, "SKU", sku)
+    _sub(item, "Title", identification.item_name[:80])
+    _sub(item, "Description", _build_description(identification))
+    if data.category_id:
+        primary_category = _sub(item, "PrimaryCategory")
+        _sub(primary_category, "CategoryID", data.category_id)
+    _sub(item, "ConditionID", data.condition_id)
+    _sub(item, "Quantity", str(quantity))
+    _sub(item, "StartPrice", f"{price:.2f}")
+    _sub(item, "Currency", currency)
+    _sub(item, "Country", location.country)
+    _sub(item, "PostalCode", location.postal_code)
+    _sub(item, "ListingDuration", "GTC")
+    _sub(item, "ListingType", "FixedPriceItem")
+
+    picture_details = _sub(item, "PictureDetails")
+    _sub(picture_details, "PictureURL", image_url)
+
+    if data.aspects:
+        item_specifics = _sub(item, "ItemSpecifics")
+        for name, values in data.aspects.items():
+            name_value_list = _sub(item_specifics, "NameValueList")
+            _sub(name_value_list, "Name", name)
+            for value in values:
+                _sub(name_value_list, "Value", value)
+
+    if data.listing_policies:
+        seller_profiles = _sub(item, "SellerProfiles")
+        if "fulfillmentPolicyId" in data.listing_policies:
+            shipping_profile = _sub(seller_profiles, "SellerShippingProfile")
+            _sub(shipping_profile, "ShippingProfileID", data.listing_policies["fulfillmentPolicyId"])
+        if "paymentPolicyId" in data.listing_policies:
+            payment_profile = _sub(seller_profiles, "SellerPaymentProfile")
+            _sub(payment_profile, "PaymentProfileID", data.listing_policies["paymentPolicyId"])
+        if "returnPolicyId" in data.listing_policies:
+            return_profile = _sub(seller_profiles, "SellerReturnProfile")
+            _sub(return_profile, "ReturnProfileID", data.listing_policies["returnPolicyId"])
+
+    # Trading API splits package weight into whole pounds + remainder ounces rather
+    # than a single decimal-pounds value.
+    shipping_package_details = _sub(item, "ShippingPackageDetails")
+    _sub(shipping_package_details, "WeightMajor", str(int(weight_lbs)))
+    _sub(shipping_package_details, "WeightMinor", str(round((weight_lbs % 1) * 16)))
+
+    return root
+
+
+class CreateListingResult(BaseModel):
+    item_id: str
+    listing_url: str
+    missing: list[str]
+    notes: list[str]
+
+
+def create_listing(
     identification: ProductIdentification,
     upload_id: str,
     image_url: str,
@@ -714,118 +632,38 @@ def create_draft_listing(
     weight_lbs: float,
     currency: str = "USD",
     quantity: int = 1,
-) -> DraftListingResult:
+) -> CreateListingResult:
+    """The ONE eBay write in this module. Combines what used to be
+    createOrReplaceInventoryItem + createOffer + publishOffer into eBay's single
+    AddFixedPriceItem call. Only ever reached via the frontend's explicit,
+    checkbox-gated "Publish to eBay" button — never automatically, never as a side
+    effect of the pre-publish review/edit screen (see resolve_draft_listing() above,
+    which never calls this). Grep for AddFixedPriceItem/create_listing as a guardrail
+    check before merging any change that touches this file — it should appear in
+    exactly this one function and its call sites, nowhere implicit.
+    """
     config = load_ebay_config()
     token = get_valid_access_token(config)
     sku = generate_sku(upload_id)
 
+    location = load_seller_location()
+    if location is None:
+        raise RuntimeError("No shipping location saved yet — set one up before publishing.")
+
     query = build_query(identification)
-    # By this point the user has already confirmed a real eBay category via the
-    # identify/confirm step — identification.category_id carries it, so this skips
-    # re-guessing from free text (falls back to it only if somehow unset).
     data = _resolve_listing_data(config, token, identification, query, category_id_override=identification.category_id)
 
-    create_or_replace_inventory_item(
-        config, token, sku, identification, image_url, data.condition_enum, data.aspects, weight_lbs, quantity
+    request_root = _build_add_fixed_price_item_request(
+        identification, image_url, price, weight_lbs, currency, quantity, data, location, sku
     )
-    data.included.append("inventory_item")
+    response_root = _call_trading_api(config, token, "AddFixedPriceItem", request_root)
+    item_id = response_root.findtext(".//eb:ItemID", namespaces=_NS)
+    if not item_id:
+        raise EbayTradingApiError([{"code": None, "message": "AddFixedPriceItem succeeded but returned no ItemID"}])
 
-    offer_id = create_offer(
-        config, token, sku, price, currency, quantity, data.category_id, data.merchant_location_key, data.listing_policies
-    )
-    data.included.append("offer")
-
-    return DraftListingResult(
-        sku=sku,
-        offer_id=offer_id,
-        included=data.included,
+    return CreateListingResult(
+        item_id=item_id,
+        listing_url=_listing_url(config, item_id),
         missing=data.missing,
         notes=data.notes,
-        aspects=data.aspects,
-        category_query=query,
     )
-
-
-def update_draft_listing(
-    offer_id: str,
-    sku: str,
-    identification: ProductIdentification,
-    image_url: str,
-    price: float,
-    weight_lbs: float,
-    currency: str = "USD",
-    quantity: int = 1,
-    category_query: str | None = None,
-) -> DraftListingResult:
-    """Re-applies edited fields to an already-created (unpublished) offer — the
-    frontend's review screen lets the user correct title/brand/condition/description/
-    category before publishing, since the automatic identification and category
-    suggestion can be wrong. Reuses the same SKU and offer_id (both calls below are
-    idempotent PUTs), so this updates in place rather than creating a duplicate.
-    """
-    config = load_ebay_config()
-    token = get_valid_access_token(config)
-
-    # An explicit category_query here means the user is changing category at this later
-    # review stage — honor that by re-suggesting from the new text rather than keeping the
-    # already-confirmed category_id. Otherwise keep what was already confirmed.
-    if category_query:
-        query = category_query
-        category_id_override = None
-    else:
-        query = build_query(identification)
-        category_id_override = identification.category_id
-    data = _resolve_listing_data(config, token, identification, query, category_id_override=category_id_override)
-
-    create_or_replace_inventory_item(
-        config, token, sku, identification, image_url, data.condition_enum, data.aspects, weight_lbs, quantity
-    )
-    data.included.append("inventory_item")
-
-    update_offer(
-        config, token, offer_id, sku, price, currency, quantity, data.category_id, data.merchant_location_key, data.listing_policies
-    )
-    data.included.append("offer")
-
-    return DraftListingResult(
-        sku=sku,
-        offer_id=offer_id,
-        included=data.included,
-        missing=data.missing,
-        notes=data.notes,
-        aspects=data.aspects,
-        category_query=query,
-    )
-
-
-def _listing_url(config: EbayConfig, listing_id: str) -> str:
-    base = "https://www.sandbox.ebay.com" if config.environment == "sandbox" else "https://www.ebay.com"
-    return f"{base}/itm/{listing_id}"
-
-
-class PublishResult(BaseModel):
-    listing_id: str
-    listing_url: str
-
-
-def publish_offer(config: EbayConfig, token: str, offer_id: str) -> PublishResult:
-    """Publish a previously-created offer, making it a real, live, publicly
-    purchasable eBay listing. Everything upstream of this call only staged a
-    draft that was invisible outside eBay's raw API — this is the one
-    genuinely consequential write in this codebase, only ever reached via an
-    explicit user action after reviewing a full preview in our own UI.
-    """
-    response = httpx.post(
-        f"{config.api_base}/sell/inventory/v1/offer/{offer_id}/publish/",
-        headers=_auth_headers(token),
-        timeout=20.0,
-    )
-    logger.info(
-        "publishOffer response: status=%d headers=%s body=%s",
-        response.status_code,
-        dict(response.headers),
-        response.text,
-    )
-    response.raise_for_status()
-    listing_id = response.json()["listingId"]
-    return PublishResult(listing_id=listing_id, listing_url=_listing_url(config, listing_id))
