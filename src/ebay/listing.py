@@ -511,6 +511,34 @@ def _sub(parent: ET.Element, tag: str, text: str | None = None) -> ET.Element:
     return el
 
 
+def _check_ack(root: ET.Element) -> None:
+    """Shared by every Trading API call (plain-XML and multipart alike): raises
+    EbayTradingApiError on Ack=Failure/PartialFailure — see EbayTradingApiError's
+    docstring for why this can't just be response.raise_for_status()."""
+    ack = root.findtext("eb:Ack", namespaces=_NS)
+    if ack in ("Failure", "PartialFailure"):
+        errors = [
+            {
+                "code": err.findtext("eb:ErrorCode", namespaces=_NS),
+                "message": (
+                    err.findtext("eb:LongMessage", namespaces=_NS)
+                    or err.findtext("eb:ShortMessage", namespaces=_NS)
+                ),
+            }
+            for err in root.findall("eb:Errors", namespaces=_NS)
+        ]
+        raise EbayTradingApiError(errors)
+
+
+def _trading_api_headers(token: str, call_name: str) -> dict[str, str]:
+    return {
+        "X-EBAY-API-SITEID": _SITE_ID,
+        "X-EBAY-API-COMPATIBILITY-LEVEL": _TRADING_API_VERSION,
+        "X-EBAY-API-CALL-NAME": call_name,
+        "X-EBAY-API-IAF-TOKEN": token,
+    }
+
+
 def _call_trading_api(config: EbayConfig, token: str, call_name: str, request_root: ET.Element) -> ET.Element:
     # encoding="utf-8" (rather than "unicode") makes ET.tostring prepend the
     # <?xml version='1.0' encoding='utf-8'?> declaration — required by eBay's Trading
@@ -518,13 +546,7 @@ def _call_trading_api(config: EbayConfig, token: str, call_name: str, request_ro
     # surfaces a generic, misleading SAXParseException about "soapenv:Body" instead of
     # any error actually describing the missing declaration (confirmed live).
     body = ET.tostring(request_root, encoding="utf-8", xml_declaration=True)
-    headers = {
-        "X-EBAY-API-SITEID": _SITE_ID,
-        "X-EBAY-API-COMPATIBILITY-LEVEL": _TRADING_API_VERSION,
-        "X-EBAY-API-CALL-NAME": call_name,
-        "X-EBAY-API-IAF-TOKEN": token,
-        "Content-Type": "text/xml",
-    }
+    headers = {**_trading_api_headers(token, call_name), "Content-Type": "text/xml"}
     logger.info(
         "%s request: url=%s headers=%s body=%s",
         call_name,
@@ -542,20 +564,70 @@ def _call_trading_api(config: EbayConfig, token: str, call_name: str, request_ro
     response.raise_for_status()  # still catches real HTTP/network-level failures
 
     root = ET.fromstring(response.text)
-    ack = root.findtext("eb:Ack", namespaces=_NS)
-    if ack in ("Failure", "PartialFailure"):
-        errors = [
-            {
-                "code": err.findtext("eb:ErrorCode", namespaces=_NS),
-                "message": (
-                    err.findtext("eb:LongMessage", namespaces=_NS)
-                    or err.findtext("eb:ShortMessage", namespaces=_NS)
-                ),
-            }
-            for err in root.findall("eb:Errors", namespaces=_NS)
-        ]
-        raise EbayTradingApiError(errors)
+    _check_ack(root)
     return root
+
+
+def upload_site_hosted_picture(config: EbayConfig, token: str, image_bytes: bytes, picture_name: str) -> str:
+    """Uploads image bytes directly to eBay Picture Services (EPS) via the Trading
+    API's UploadSiteHostedPictures call, returning the resulting EPS-hosted FullURL
+    (an https://i.ebayimg.com/... URL).
+
+    Used instead of pointing AddFixedPriceItem's PictureDetails/PictureURL at the
+    Supabase-hosted image directly: eBay's backend auto-mirrors self-hosted
+    PictureURLs into EPS behind the scenes, and when that mirroring is inconsistent it
+    fails the listing with errorId 20004 "A mixture of Self Hosted and EPS pictures
+    are not allowed" — a real, recurring issue confirmed via eBay developer/community
+    reports, not specific to this app's own request shape. Pre-uploading directly to
+    EPS ourselves avoids that ambiguity entirely, since we then only ever reference an
+    EPS URL.
+
+    Unlike every other Trading API call in this module, this one is a MIME-multipart
+    POST (XML control fields + the raw image bytes as a second part), not a plain XML
+    body — eBay's docs are explicit that the binary can't be embedded in the XML
+    itself (e.g. base64-inlined); it must be a separate multipart section.
+    """
+    request_xml = ET.Element(f"{{{_EB_NS_URI}}}UploadSiteHostedPicturesRequest")
+    ET.register_namespace("", _EB_NS_URI)
+    _sub(request_xml, "PictureName", picture_name)
+    # "Supersize" matches the standard image sizing (incl. zoom) eBay's own web/app
+    # listing photos use — the same quality level a self-hosted PictureURL implied.
+    _sub(request_xml, "PictureSet", "Supersize")
+    xml_body = ET.tostring(request_xml, encoding="utf-8", xml_declaration=True)
+
+    headers = _trading_api_headers(token, "UploadSiteHostedPictures")
+    logger.info(
+        "UploadSiteHostedPictures request: url=%s headers=%s picture_name=%s image_bytes=%d",
+        f"{config.api_base}/ws/api.dll",
+        {k: v for k, v in headers.items() if k != "X-EBAY-API-IAF-TOKEN"},
+        picture_name,
+        len(image_bytes),
+    )
+    response = httpx.post(
+        f"{config.api_base}/ws/api.dll",
+        headers=headers,
+        # httpx builds a proper multipart/form-data body (with boundary) whenever
+        # `files` is given — do NOT also set a Content-Type header, or it'll clobber
+        # the boundary httpx generates.
+        data={"XML Payload": xml_body},
+        files={"dummy": (f"{picture_name}.jpg", image_bytes, "image/jpeg")},
+        timeout=60.0,
+    )
+    logger.info(
+        "UploadSiteHostedPictures response: status=%d body=%s",
+        response.status_code,
+        response.text[:2000],
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.text)
+    _check_ack(root)
+    full_url = root.findtext(".//eb:SiteHostedPictureDetails/eb:FullURL", namespaces=_NS)
+    if not full_url:
+        raise EbayTradingApiError(
+            [{"code": None, "message": "UploadSiteHostedPictures succeeded but returned no FullURL"}]
+        )
+    return full_url
 
 
 def _build_add_fixed_price_item_request(
@@ -655,11 +727,20 @@ def create_listing(
     if location is None:
         raise RuntimeError("No shipping location saved yet — set one up before publishing.")
 
+    # Re-host on eBay's own Picture Services (EPS) rather than pointing
+    # PictureDetails/PictureURL at the Supabase URL directly — see
+    # upload_site_hosted_picture()'s docstring for why self-hosted URLs are unreliable
+    # here. Supabase stays the durable source of truth for the image itself; this just
+    # changes what URL gets handed to eBay for this one listing.
+    image_response = httpx.get(image_url, timeout=30.0)
+    image_response.raise_for_status()
+    eps_picture_url = upload_site_hosted_picture(config, token, image_response.content, sku)
+
     query = build_query(identification)
     data = _resolve_listing_data(config, token, identification, query, category_id_override=identification.category_id)
 
     request_root = _build_add_fixed_price_item_request(
-        identification, image_url, price, weight_lbs, currency, quantity, data, location, sku
+        identification, eps_picture_url, price, weight_lbs, currency, quantity, data, location, sku
     )
     response_root = _call_trading_api(config, token, "AddFixedPriceItem", request_root)
     item_id = response_root.findtext(".//eb:ItemID", namespaces=_NS)
