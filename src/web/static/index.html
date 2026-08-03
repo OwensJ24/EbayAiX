@@ -26,6 +26,12 @@
   .confirm-row { display: flex; align-items: flex-start; gap: 0.5rem; font-weight: normal; margin-top: 1rem; }
   .confirm-row input[type="checkbox"] { width: auto; margin: 0.2rem 0 0; }
   .publish-danger { background: #fdeaea; border: 1px solid #d9534f; border-radius: 6px; padding: 0.75rem 1rem; margin-top: 0.5rem; }
+  .comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; margin-top: 0.5rem; }
+  .comp-card { border: 1px solid #ccc; border-radius: 8px; padding: 0.5rem; font-size: 0.85rem; }
+  .comp-card img { width: 100%; height: 120px; object-fit: contain; border-radius: 4px; margin-bottom: 0.4rem; background: #f5f5f5; }
+  .comp-card .comp-title { margin: 0 0 0.25rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .comp-card .comp-price { margin: 0 0 0.25rem; }
+  .comp-card .comp-condition { margin: 0; color: #555; }
 </style>
 </head>
 <body>
@@ -404,12 +410,21 @@
           return data;
         })
         .then((data) => {
-          priceStatusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
-
           const comps = data.result.comparable_listings || [];
           if (comps.length) {
             const avg = comps.reduce((sum, c) => sum + c.price, 0) / comps.length;
             priceInput.value = avg.toFixed(2);
+
+            priceStatusEl.innerHTML = `<div class="comp-grid">${comps.map((c) => `
+              <div class="comp-card">
+                ${c.image_url ? `<img src="${c.image_url}" alt="${escapeHtml(c.title)}">` : ''}
+                <p class="comp-title">${escapeHtml(c.title)}</p>
+                <p class="comp-price">${c.currency} ${c.price.toFixed(2)}</p>
+                ${c.condition ? `<p class="comp-condition">${escapeHtml(c.condition)}</p>` : ''}
+              </div>
+            `).join('')}</div>`;
+          } else {
+            priceStatusEl.innerHTML = '<p>No comparable listings found.</p>';
           }
           draftStatusEl.innerHTML = '';
           draftSection.style.display = 'block';

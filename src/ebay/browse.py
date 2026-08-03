@@ -40,6 +40,7 @@ class EbayComp(BaseModel):
     currency: str
     condition: str | None = None
     item_url: str | None = None
+    image_url: str | None = None
 
 
 def build_query(identification: "ProductIdentification") -> str:
@@ -109,5 +110,6 @@ def search_comparable_listings(query: str, limit: int = 3) -> list[EbayComp]:
             currency=price_info.get("currency", "USD"),
             condition=item.get("condition"),
             item_url=item.get("itemWebUrl"),
+            image_url=(item.get("image") or {}).get("imageUrl"),
         ))
     return comps
