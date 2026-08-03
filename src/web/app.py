@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageCms, UnidentifiedImageError
 from pydantic import BaseModel
 
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
@@ -52,6 +52,9 @@ EBAY_MIN_IMAGE_DIMENSION = 500
 # mid-flight (a 502 from Render's own proxy, not one of this app's own error responses)
 # before any of our own logging or error handling ever runs.
 EBAY_MAX_IMAGE_DIMENSION = 1600
+
+# Built once, reused for every color-managed conversion in _to_srgb() below.
+_SRGB_PROFILE = ImageCms.createProfile("sRGB")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 UPLOAD_DIR = _PROJECT_ROOT / "data" / "uploads"
@@ -96,6 +99,31 @@ def _read_upload_within_limit(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _to_srgb(image: Image.Image) -> Image.Image:
+    """Color-manages the image into real sRGB pixel values using its embedded ICC
+    profile (if any), rather than just tagging/dropping metadata. iPhones (and many
+    Android cameras) shoot in Display P3, a wider gamut than sRGB — a plain
+    `.convert("RGB")` leaves the original P3-authored numeric pixel values untouched,
+    and this app's save() call never re-attached the embedded profile, so any viewer
+    that assumes sRGB (which is most of them, and — critically — very likely eBay's own
+    image pipeline, which we can't confirm is color-profile-aware) rendered those
+    numbers as if they were already sRGB: real, saturated colors came out visibly
+    duller/greyer. Converting the actual pixels to sRGB up front fixes this everywhere,
+    color-managed viewer or not, since the raw bytes are correct instead of relying on
+    downstream profile support. Falls back to a plain mode conversion when there's no
+    embedded profile (most images, already sRGB) or the profile can't be parsed.
+    """
+    icc_bytes = image.info.get("icc_profile")
+    if not icc_bytes:
+        return image.convert("RGB")
+    try:
+        source_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+        return ImageCms.profileToProfile(image, source_profile, _SRGB_PROFILE, outputMode="RGB")
+    except ImageCms.PyCMSError as e:
+        logger.info("Ignoring unparseable embedded ICC profile: %r", e)
+        return image.convert("RGB")
+
+
 def _validate_and_normalize_image(contents: bytes) -> bytes:
     """Validates dimensions and always re-encodes to JPEG (downscaling first if needed)
     — unconditionally, not just when downscaling. This keeps every upload's Supabase
@@ -122,7 +150,7 @@ def _validate_and_normalize_image(contents: bytes) -> bytes:
             ),
         )
 
-    image = image.convert("RGB")
+    image = _to_srgb(image)
     if max(width, height) > EBAY_MAX_IMAGE_DIMENSION:
         image.thumbnail((EBAY_MAX_IMAGE_DIMENSION, EBAY_MAX_IMAGE_DIMENSION), Image.LANCZOS)
     buf = io.BytesIO()
