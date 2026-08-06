@@ -82,8 +82,11 @@ def _auth_headers(token: str) -> dict[str, str]:
     }
 
 
-def generate_sku(upload_id: str) -> str:
-    return f"agentx-{upload_id}"
+def generate_sku(upload_id: str, item_index: int) -> str:
+    # item_index disambiguates SKUs when several items are published from the same
+    # upload_id — a single batch upload (see app.py's /api/identify) can hold multiple
+    # items' photos, each published independently, and eBay requires unique SKUs.
+    return f"agentx-{upload_id}-{item_index}"
 
 
 def _build_description(identification: ProductIdentification) -> str:
@@ -705,6 +708,7 @@ class CreateListingResult(BaseModel):
 def create_listing(
     identification: ProductIdentification,
     upload_id: str,
+    item_index: int,
     image_urls: list[str],
     price: float,
     weight_lbs: float,
@@ -720,13 +724,17 @@ def create_listing(
     check before merging any change that touches this file — it should appear in
     exactly this one function and its call sites, nowhere implicit.
 
-    `image_urls` can be up to MAX_IMAGES (see app.py) Supabase-hosted photos — every
-    one of them is re-hosted on EPS and attached to the listing (see the loop below),
-    not just a single primary photo.
+    `image_urls` can be up to MAX_ITEM_IMAGES (see app.py) Supabase-hosted photos —
+    every one of them is re-hosted on EPS and attached to the listing (see the loop
+    below), not just a single primary photo. `upload_id` now identifies a whole batch
+    of photos that can span several items (see app.py's /api/identify), so
+    `item_index` — this item's position within that batch — is required for SKU
+    uniqueness (see generate_sku()); two items from the same batch must never collide
+    on the same SKU.
     """
     config = load_ebay_config()
     token = get_valid_access_token(config)
-    sku = generate_sku(upload_id)
+    sku = generate_sku(upload_id, item_index)
 
     location = load_seller_location()
     if location is None:

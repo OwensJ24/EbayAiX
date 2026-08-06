@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageCms, UnidentifiedImageError
 from pydantic import BaseModel
 
-from src.agents.vision_subagent import ProductIdentification, VisionSubagent
+from src.agents.vision_subagent import ItemCluster, ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, get_application_access_token, load_ebay_browse_config, search_comparable_listings
 from src.ebay.config import load_ebay_config
 from src.ebay.listing import EbayTradingApiError, create_listing, get_required_aspects, resolve_draft_listing, suggest_categories
@@ -35,13 +35,28 @@ T = TypeVar("T")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-# An item can have up to this many photos, all of which get attached to the eBay
-# listing itself (see src/ebay/listing.py's create_listing()) — but only the first
-# MAX_ANALYSIS_IMAGES are sent to Claude for identification, since a handful of angles
-# is enough to identify an item and analyzing all 10 would multiply vision-call cost
-# for little added benefit.
-MAX_IMAGES = 10
+# The whole batch a single /api/identify call accepts, potentially spanning several
+# different items — Claude clusters them by item (see cluster_items() below) before
+# anything else happens. Bounded because the clustering call sends every photo in the
+# batch to Claude in one message; unbounded would mean unbounded cost/context per
+# upload.
+MAX_BATCH_IMAGES = 60
+# eBay's own real per-listing limit (confirmed against eBay's docs: AddFixedPriceItem
+# accepts up to 24 self-hosted PictureURLs) — enforced defensively at publish time
+# (see publish_listing_route() below), not at upload time, since how many photos end
+# up clustered into one item isn't known until after cluster_items() runs.
+MAX_ITEM_IMAGES = 24
+# Only the first MAX_ANALYSIS_IMAGES of *one item's* photos are sent to Claude's
+# identify() call, independent of how many photos that item ends up with — a handful
+# of angles is enough to identify an item, and analyzing all of them would multiply
+# vision-call cost for little added benefit.
 MAX_ANALYSIS_IMAGES = 5
+# Longest side, in pixels, for the separate thumbnail set built just for the batch
+# clustering call (see _thumbnail_for_clustering() below) — distinct from
+# EBAY_MAX_IMAGE_DIMENSION below, since clustering only needs enough resolution to
+# visually distinguish items, not eBay-listing quality, and a batch can be up to
+# MAX_BATCH_IMAGES full images in one Claude message.
+CLUSTERING_THUMBNAIL_SIZE = 512
 # eBay's own image requirements: below 500px on either dimension, "the listing may be
 # blocked" — silently, not with a clean rejection at listing-creation time, which is
 # exactly the "image not showing up" failure mode this guards against.
@@ -50,8 +65,8 @@ EBAY_MIN_IMAGE_DIMENSION = 500
 # just a quality preference — so downscaling anything larger than this to 1600px on its
 # longest side stays within eBay's own guidance while capping how much raw pixel data
 # gets base64-encoded for each Claude vision call and uploaded to Supabase/eBay. A
-# full-resolution modern phone photo (4000px+, several MB), multiplied by up to 10
-# photos per item, was plausibly large enough to push Render's free-tier request past
+# full-resolution modern phone photo (4000px+, several MB), multiplied by up to
+# MAX_BATCH_IMAGES per upload, was plausibly large enough to push Render's free-tier request past
 # its timeout or memory limit with zero application-level logging — the request dies
 # mid-flight (a 502 from Render's own proxy, not one of this app's own error responses)
 # before any of our own logging or error handling ever runs.
@@ -162,6 +177,46 @@ def _read_and_normalize_upload(file: UploadFile) -> bytes:
     return _validate_and_normalize_image(contents)
 
 
+def _thumbnail_for_clustering(image_bytes: bytes) -> bytes:
+    """Downscales an already-normalized (eBay-quality, up to 1600px) image to a small
+    thumbnail just for the batch clustering call — a batch can be up to MAX_BATCH_IMAGES
+    full images, and clustering only needs enough resolution to visually tell items
+    apart, not eBay-listing quality. The original normalized bytes (not this thumbnail)
+    are what's actually uploaded to Supabase and later analyzed per-item."""
+    image = Image.open(io.BytesIO(image_bytes))
+    image.thumbnail((CLUSTERING_THUMBNAIL_SIZE, CLUSTERING_THUMBNAIL_SIZE), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
+
+
+def _normalize_clusters(clusters: list[ItemCluster], total: int) -> list[ItemCluster]:
+    """Validates/repairs Claude's clustering output before it's trusted: drops
+    out-of-range indices, dedupes (first assignment wins), and appends any photo index
+    Claude never assigned as its own singleton item — so every uploaded photo always
+    ends up belonging to exactly one item, never silently dropped. Falls back to one
+    cluster containing every photo if Claude's output is unusable (e.g. empty), rather
+    than failing the whole upload.
+    """
+    seen: set[int] = set()
+    repaired: list[ItemCluster] = []
+    for cluster in clusters:
+        indices = [i for i in cluster.photo_indices if 0 <= i < total and i not in seen]
+        if not indices:
+            continue
+        seen.update(indices)
+        repaired.append(ItemCluster(photo_indices=indices, item_name=cluster.item_name, category=cluster.category))
+
+    missing = [i for i in range(total) if i not in seen]
+    for i in missing:
+        repaired.append(ItemCluster(photo_indices=[i], item_name="Unidentified Item", category="Other"))
+
+    if not repaired:
+        repaired = [ItemCluster(photo_indices=list(range(total)), item_name="Unidentified Item", category="Other")]
+
+    return repaired
+
+
 def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
     """Run a Claude-backed subagent call, translating transient API failures into clean HTTP errors."""
     try:
@@ -219,19 +274,22 @@ def _fetch_image(url: str) -> bytes:
 
 @app.post("/api/identify")
 def identify(files: list[UploadFile] = File(...)) -> dict:
-    """Phase 1 of 2: a cheap preview guess (name + category) only — never the full
-    analysis. The user must confirm/edit both via POST /api/identify/confirm before
-    brand/model/condition/description get analyzed at all (see that route below).
+    """Uploads a whole batch of photos — potentially several different items in one
+    session — and groups them by distinct physical item. Never runs the full analysis;
+    the user picks one detected item at a time from the resulting menu and confirms/
+    edits its name+category via POST /api/identify/confirm before brand/model/
+    condition/description get analyzed at all (see that route below).
 
-    Accepts up to MAX_IMAGES photos of the same item — all of them get attached to the
-    eBay listing itself at publish time (see src/ebay/listing.py's create_listing()),
-    but only the first MAX_ANALYSIS_IMAGES are sent to Claude here and in
-    /api/identify/confirm below.
+    Accepts up to MAX_BATCH_IMAGES photos total. Every photo is uploaded to Supabase
+    regardless of which item it ends up clustered into (all of them get attached to
+    their item's eBay listing at publish time — see src/ebay/listing.py's
+    create_listing()); clustering itself runs on a separate, smaller thumbnail set
+    (see _thumbnail_for_clustering()) to keep that one Claude call's cost bounded.
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one photo is required.")
-    if len(files) > MAX_IMAGES:
-        raise HTTPException(status_code=400, detail=f"Up to {MAX_IMAGES} photos are allowed per item.")
+    if len(files) > MAX_BATCH_IMAGES:
+        raise HTTPException(status_code=400, detail=f"Up to {MAX_BATCH_IMAGES} photos are allowed per upload.")
 
     # Validate/normalize every file into memory *before* uploading any of them, so a
     # single bad file (e.g. too small) aborts cleanly with nothing partially written to
@@ -247,22 +305,23 @@ def identify(files: list[UploadFile] = File(...)) -> dict:
     for i, image_bytes in enumerate(normalized_images):
         _call_storage(upload_image, storage_config, upload_id, i, image_bytes)
 
-    analysis_images = [(b, "image/jpeg") for b in normalized_images[:MAX_ANALYSIS_IMAGES]]
-    preview = _call_claude(_vision_subagent.preview, analysis_images)
-
-    # Application-level (client-credentials) eBay token, not the user's OAuth one —
-    # category suggestions are public Taxonomy data, so this works even before the user
-    # has connected their own eBay account (same reasoning as browse.py's comp pricing).
-    browse_config = _call_ebay(load_ebay_browse_config)
-    app_token = _call_ebay(get_application_access_token, browse_config)
-    suggestions = _call_ebay(suggest_categories, browse_config, app_token, preview.category)
+    clustering_images = [(_thumbnail_for_clustering(b), "image/jpeg") for b in normalized_images]
+    cluster_result = _call_claude(_vision_subagent.cluster_items, clustering_images)
+    items = _normalize_clusters(cluster_result.items, len(files))
 
     return {
-        "status": "preview",
+        "status": "batch_preview",
         "upload_id": upload_id,
         "image_count": len(files),
-        "item_name": preview.item_name,
-        "category_suggestions": [s.model_dump() for s in suggestions],
+        "items": [
+            {
+                "item_index": idx,
+                "photo_indices": item.photo_indices,
+                "item_name": item.item_name,
+                "category": item.category,
+            }
+            for idx, item in enumerate(items)
+        ],
     }
 
 
@@ -285,7 +344,7 @@ class ConfirmItemRequest(BaseModel):
     item_name: str
     category_id: str
     category_name: str
-    image_count: int
+    photo_indices: list[int]
 
 
 @app.post("/api/identify/confirm")
@@ -295,14 +354,16 @@ def confirm_item(payload: ConfirmItemRequest) -> dict:
     passed in as ground truth context rather than re-guessed.
 
     This is a separate HTTP request from /api/identify with no server-side session
-    state, so the first MAX_ANALYSIS_IMAGES photos are re-fetched from their
-    already-uploaded Supabase public URLs rather than kept in memory across requests.
+    state, so the first MAX_ANALYSIS_IMAGES of this item's own photos (its
+    photo_indices, as assigned by /api/identify's clustering — not necessarily a
+    contiguous range, since a batch can hold several items' photos interleaved) are
+    re-fetched from their already-uploaded Supabase public URLs rather than kept in
+    memory across requests.
     """
     storage_config = _call_storage(load_supabase_storage_config)
-    analysis_count = min(payload.image_count, MAX_ANALYSIS_IMAGES)
     analysis_images = [
         (_call_storage(_fetch_image, public_url(storage_config, payload.upload_id, i)), "image/jpeg")
-        for i in range(analysis_count)
+        for i in payload.photo_indices[:MAX_ANALYSIS_IMAGES]
     ]
 
     # Application-level eBay token — needed to fetch this category's required item
@@ -413,7 +474,11 @@ class PublishListingRequest(BaseModel):
     price: float
     weight_lbs: float
     currency: str = "USD"
-    image_count: int
+    photo_indices: list[int]
+    # Since several items can share one upload_id (a batch), item_index disambiguates
+    # this item's SKU from any other item published from the same batch — see
+    # generate_sku() in listing.py.
+    item_index: int
 
 
 @app.post("/api/listing/publish/{upload_id}")
@@ -424,11 +489,15 @@ def publish_listing_route(upload_id: str, payload: PublishListingRequest) -> dic
     unpublished state to review beforehand; this route is only ever called from an
     explicit user click after that review, never automatically."""
     storage_config = _call_storage(load_supabase_storage_config)
-    image_urls = [public_url(storage_config, upload_id, i) for i in range(payload.image_count)]
+    # [:MAX_ITEM_IMAGES] is a defensive cap, not an expected trim — a cluster could in
+    # principle end up with more than eBay's 24-photo-per-listing limit if a batch is
+    # mostly one item, and this guarantees publish never exceeds it regardless.
+    image_urls = [public_url(storage_config, upload_id, i) for i in payload.photo_indices[:MAX_ITEM_IMAGES]]
     result = _call_ebay(
         create_listing,
         payload.identification,
         upload_id,
+        payload.item_index,
         image_urls,
         payload.price,
         payload.weight_lbs,

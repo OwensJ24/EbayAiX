@@ -34,6 +34,19 @@ _PREVIEW_SYSTEM_PROMPT = (
     f"these before a second, more detailed analysis. {_MULTI_IMAGE_NOTE}"
 )
 
+_CLUSTER_SYSTEM_PROMPT = (
+    "You are sorting a batch of resale photos for an e-commerce reselling pipeline. The "
+    "photos are numbered 0 to N-1, in the order given. Each photo shows exactly one "
+    "physical item for resale, but the SAME item may appear in more than one photo — "
+    "different angles, a tag or label, packaging — and those photos are not necessarily "
+    "consecutive. Group the photo numbers by distinct physical item: every number from 0 "
+    "to N-1 must appear in exactly one group, with no number skipped or duplicated. If "
+    "every photo shows the same single item, return one group containing every number. "
+    "For each group, give the same kind of quick best-guess item name and eBay category "
+    "you'd give for a single item on a fast first pass — a human will confirm or correct "
+    "these before a second, more detailed per-item analysis."
+)
+
 _SYSTEM_PROMPT = (
     "You are a product identification specialist for an e-commerce reselling pipeline. "
     "The item's name and eBay category have already been confirmed by a human — treat "
@@ -64,6 +77,18 @@ _SYSTEM_PROMPT = (
 class ItemPreview(BaseModel):
     item_name: str = Field(description="Clean, human-readable product title suitable for a listing")
     category: str = Field(description="Specific product category guess, e.g. 'Digital SLR Camera'")
+
+
+class ItemCluster(BaseModel):
+    photo_indices: list[int] = Field(
+        description="0-based indices of the photos (in the order provided) that show this one physical item"
+    )
+    item_name: str = Field(description="Clean, human-readable product title suitable for a listing")
+    category: str = Field(description="Specific product category guess, e.g. 'Digital SLR Camera'")
+
+
+class BatchClusterResult(BaseModel):
+    items: list[ItemCluster]
 
 
 class ProductIdentification(BaseModel):
@@ -121,6 +146,28 @@ class VisionSubagent:
             system=_PREVIEW_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
             output_format=ItemPreview,
+        )
+        return response.parsed_output
+
+    def cluster_items(self, images: list[tuple[bytes, str]]) -> BatchClusterResult:
+        """Groups a batch of photos by distinct physical item — the first pass over a
+        multi-item upload, before any per-item confirm/analyze happens. `images` should
+        be small/cheap thumbnails, not full eBay-quality images (see
+        CLUSTERING_THUMBNAIL_SIZE in app.py) — a batch can be up to MAX_BATCH_IMAGES
+        photos, and this sends all of them in one message.
+        """
+        content = self._image_blocks(images)
+        content.append({
+            "type": "text",
+            "text": f"Group these {len(images)} photos (numbered 0 to {len(images) - 1}) by distinct physical item.",
+        })
+
+        response = self.client.messages.parse(
+            model=self.model,
+            max_tokens=4096,
+            system=_CLUSTER_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+            output_format=BatchClusterResult,
         )
         return response.parsed_output
 

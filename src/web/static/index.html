@@ -186,6 +186,76 @@
       margin: 0;
       color: #555;
     }
+
+    .item-card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .item-card {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 0.75rem;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .item-card img {
+      width: 100%;
+      height: 130px;
+      object-fit: cover;
+      border-radius: 4px;
+      margin-bottom: 0.5rem;
+      background: #f5f5f5;
+    }
+
+    .item-card-name {
+      margin: 0 0 0.15rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    .item-card-category,
+    .item-card-photos {
+      margin: 0 0 0.15rem;
+      font-size: 0.8rem;
+      color: #555;
+    }
+
+    .item-card-status {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.1rem 0.5rem;
+      border-radius: 999px;
+      margin: 0.25rem 0 0.5rem;
+      width: fit-content;
+    }
+
+    .status-not_started {
+      background: #eee;
+      color: #555;
+    }
+
+    .status-in_progress {
+      background: #fff8e1;
+      color: #8a6d00;
+    }
+
+    .status-published {
+      background: #e6f4ea;
+      color: #1e7e34;
+    }
+
+    .item-card button {
+      margin-top: auto;
+    }
+
+    #backToMenuButton {
+      margin-bottom: 1rem;
+    }
   </style>
 </head>
 
@@ -206,92 +276,115 @@
     </div>
   </details>
 
-  <p>Upload 1-10 photos of the item (JPEG/PNG/WEBP, up to 10MB each). All of them are
-    attached to the eBay listing; the first 5 are used for identification — include a
-    tag or label photo if it shows details like size that aren't visible elsewhere.</p>
+  <div id="uploadSection">
+    <p>Upload all the photos for however many items you're listing in this session —
+      JPEG/PNG/WEBP, up to 10MB each, up to 60 total. Claude groups them by which
+      physical item each photo shows, then you'll pick one item at a time to finish
+      listing. Include a tag or label photo for an item if it shows details like size
+      that aren't visible elsewhere.</p>
 
-  <div id="dropzone">
-    <p>Click to choose photos, or drag them here</p>
-    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
-  </div>
-
-  <div id="previewThumbs"></div>
-  <div id="status"></div>
-  <div id="confirmSection" style="display:none;">
-    <p><strong>Confirm what this item is before analysis</strong> — the rest of the
-      analysis (brand, model, condition, description) is based on what you confirm here,
-      so fix anything wrong before continuing.</p>
-    <label for="confirmItemNameInput">Item name</label>
-    <input type="text" id="confirmItemNameInput">
-    <label for="categorySelect">eBay category</label>
-    <select id="categorySelect"></select>
-    <label for="categorySearchInput">Search different category terms</label>
-    <input type="text" id="categorySearchInput" placeholder="e.g. bluetooth over-ear headphones">
-    <button id="categorySearchButton">Search</button>
-    <div id="categorySearchStatus"></div>
-    <button id="confirmItemButton">Confirm &amp; Analyze</button>
-    <div id="confirmStatus"></div>
-  </div>
-  <div id="priceStatus"></div>
-
-  <div id="draftSection" style="display:none;">
-    <label for="priceInput">Listing price (USD)</label>
-    <input type="number" id="priceInput" min="0.01" step="0.01">
-    <label for="weightInput">Package weight (lbs, including packaging)</label>
-    <input type="number" id="weightInput" min="0.1" step="0.1" placeholder="e.g. 1.5">
-    <button id="draftButton">Create Draft Listing</button>
-    <div id="draftStatus"></div>
-  </div>
-
-  <div id="previewSection" style="display:none;">
-    <label>Review and edit before publishing</label>
-    <div class="listing-preview">
-      <img id="previewListingImg" alt="listing image">
-      <p id="previewPhotoCount" style="font-size:0.85rem; color:#555; margin:0 0 0.5rem;"></p>
-      <label for="editTitle">Title</label>
-      <input type="text" id="editTitle" maxlength="80">
-      <label for="editBrand">Brand</label>
-      <input type="text" id="editBrand">
-      <label for="editCondition">Condition</label>
-      <select id="editCondition">
-        <option value="New">New</option>
-        <option value="Like New">Like New</option>
-        <option value="Very Good">Very Good</option>
-        <option value="Good">Good</option>
-        <option value="Acceptable">Acceptable</option>
-        <option value="For Parts">For Parts</option>
-      </select>
-      <label for="editCategoryQuery">eBay category search terms</label>
-      <input type="text" id="editCategoryQuery">
-      <label for="editDescription">Description</label>
-      <textarea id="editDescription" rows="6"
-        style="width:100%; box-sizing:border-box; padding:0.4rem; margin-top:0.5rem; font-family:inherit;"></textarea>
-      <div id="aspectsDisplay"></div>
+    <div id="dropzone">
+      <p>Click to choose photos, or drag them here</p>
+      <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
     </div>
-    <button id="saveChangesButton">Save Changes</button>
-    <div id="saveStatus"></div>
-    <div class="warning" id="draftWarnings" style="display:none;"></div>
 
-    <div class="publish-danger">
-      <strong>Publishing makes this a real, live eBay listing.</strong> It becomes
-      publicly visible and immediately purchasable by real buyers — this is not a
-      reversible preview action.
+    <div id="previewThumbs"></div>
+    <div id="status"></div>
+  </div>
+
+  <div id="menuSection" style="display:none;">
+    <p id="menuIntro"></p>
+    <button id="newBatchButton">Start a new batch</button>
+    <div id="menuList" class="item-card-grid"></div>
+  </div>
+
+  <div id="itemDetailSection" style="display:none;">
+    <button id="backToMenuButton">&larr; Back to items</button>
+    <div id="itemStatus"></div>
+    <div id="confirmSection" style="display:none;">
+      <p><strong>Confirm what this item is before analysis</strong> — the rest of the
+        analysis (brand, model, condition, description) is based on what you confirm here,
+        so fix anything wrong before continuing.</p>
+      <label for="confirmItemNameInput">Item name</label>
+      <input type="text" id="confirmItemNameInput">
+      <label for="categorySelect">eBay category</label>
+      <select id="categorySelect"></select>
+      <label for="categorySearchInput">Search different category terms</label>
+      <input type="text" id="categorySearchInput" placeholder="e.g. bluetooth over-ear headphones">
+      <button id="categorySearchButton">Search</button>
+      <div id="categorySearchStatus"></div>
+      <button id="confirmItemButton">Confirm &amp; Analyze</button>
+      <div id="confirmStatus"></div>
     </div>
-    <label class="confirm-row" for="confirmPublish">
-      <input type="checkbox" id="confirmPublish">
-      I understand this will create a real, live eBay listing that buyers can purchase immediately.
-    </label>
-    <button id="publishButton" disabled>Publish to eBay</button>
-    <div id="publishStatus"></div>
+    <div id="priceStatus"></div>
+
+    <div id="draftSection" style="display:none;">
+      <label for="priceInput">Listing price (USD)</label>
+      <input type="number" id="priceInput" min="0.01" step="0.01">
+      <label for="weightInput">Package weight (lbs, including packaging)</label>
+      <input type="number" id="weightInput" min="0.1" step="0.1" placeholder="e.g. 1.5">
+      <button id="draftButton">Create Draft Listing</button>
+      <div id="draftStatus"></div>
+    </div>
+
+    <div id="previewSection" style="display:none;">
+      <label>Review and edit before publishing</label>
+      <div class="listing-preview">
+        <img id="previewListingImg" alt="listing image">
+        <p id="previewPhotoCount" style="font-size:0.85rem; color:#555; margin:0 0 0.5rem;"></p>
+        <label for="editTitle">Title</label>
+        <input type="text" id="editTitle" maxlength="80">
+        <label for="editBrand">Brand</label>
+        <input type="text" id="editBrand">
+        <label for="editCondition">Condition</label>
+        <select id="editCondition">
+          <option value="New">New</option>
+          <option value="Like New">Like New</option>
+          <option value="Very Good">Very Good</option>
+          <option value="Good">Good</option>
+          <option value="Acceptable">Acceptable</option>
+          <option value="For Parts">For Parts</option>
+        </select>
+        <label for="editCategoryQuery">eBay category search terms</label>
+        <input type="text" id="editCategoryQuery">
+        <label for="editDescription">Description</label>
+        <textarea id="editDescription" rows="6"
+          style="width:100%; box-sizing:border-box; padding:0.4rem; margin-top:0.5rem; font-family:inherit;"></textarea>
+        <div id="aspectsDisplay"></div>
+      </div>
+      <button id="saveChangesButton">Save Changes</button>
+      <div id="saveStatus"></div>
+      <div class="warning" id="draftWarnings" style="display:none;"></div>
+
+      <div class="publish-danger">
+        <strong>Publishing makes this a real, live eBay listing.</strong> It becomes
+        publicly visible and immediately purchasable by real buyers — this is not a
+        reversible preview action.
+      </div>
+      <label class="confirm-row" for="confirmPublish">
+        <input type="checkbox" id="confirmPublish">
+        I understand this will create a real, live eBay listing that buyers can purchase immediately.
+      </label>
+      <button id="publishButton" disabled>Publish to eBay</button>
+      <div id="publishStatus"></div>
+    </div>
   </div>
 
   <script>
     const MAX_BYTES = 10 * 1024 * 1024;
-    const MAX_IMAGES = 10;
+    const MAX_BATCH_IMAGES = 60;
+    const uploadSection = document.getElementById('uploadSection');
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
     const previewThumbsEl = document.getElementById('previewThumbs');
     const statusEl = document.getElementById('status');
+    const menuSection = document.getElementById('menuSection');
+    const menuIntroEl = document.getElementById('menuIntro');
+    const menuListEl = document.getElementById('menuList');
+    const newBatchButton = document.getElementById('newBatchButton');
+    const itemDetailSection = document.getElementById('itemDetailSection');
+    const backToMenuButton = document.getElementById('backToMenuButton');
+    const itemStatusEl = document.getElementById('itemStatus');
     const confirmSection = document.getElementById('confirmSection');
     const confirmItemNameInput = document.getElementById('confirmItemNameInput');
     const categorySelect = document.getElementById('categorySelect');
@@ -322,8 +415,13 @@
     const publishButton = document.getElementById('publishButton');
     const publishStatusEl = document.getElementById('publishStatus');
 
-    let currentUploadId = null;
-    let currentImageCount = 0;
+    // currentBatch.items: [{item_index, photo_indices, item_name, category, status}]
+    // status is client-side only ('not_started' | 'in_progress' | 'published') — this
+    // app has no server-side session state, so the whole batch is lost on page refresh
+    // (same pre-existing lack of persistence as before this feature, just now covering
+    // several items' worth of work instead of one).
+    let currentBatch = null;
+    let currentItemIndex = null;
     let currentPreviewThumbUrls = [];
     let currentIdentification = null;
     let currentDraftResult = null;
@@ -345,6 +443,28 @@
         return data.detail.map((e) => e.msg || JSON.stringify(e)).join('; ');
       }
       return data.detail || 'Request failed';
+    }
+
+    // Resets everything specific to *working on one item* — called both when a new
+    // batch is uploaded and when switching to a (possibly different) item within the
+    // current batch. Does not touch currentBatch itself.
+    function resetItemFlowState() {
+      confirmSection.style.display = 'none';
+      confirmStatusEl.innerHTML = '';
+      categorySearchStatusEl.innerHTML = '';
+      categorySearchInput.value = '';
+      itemStatusEl.innerHTML = '';
+      priceStatusEl.innerHTML = '';
+      draftSection.style.display = 'none';
+      draftStatusEl.innerHTML = '';
+      previewSection.style.display = 'none';
+      publishStatusEl.innerHTML = '';
+      saveStatusEl.innerHTML = '';
+      confirmPublishCheckbox.checked = false;
+      confirmPublishCheckbox.disabled = false;
+      publishButton.disabled = true;
+      currentIdentification = null;
+      currentDraftResult = null;
     }
 
     const ebayStatusEl = document.getElementById('ebayStatus');
@@ -414,26 +534,15 @@
       // batches of images in quick succession).
       if (isUploading) return;
 
-      confirmSection.style.display = 'none';
-      confirmStatusEl.innerHTML = '';
-      categorySearchStatusEl.innerHTML = '';
-      categorySearchInput.value = '';
-      priceStatusEl.innerHTML = '';
-      draftSection.style.display = 'none';
-      draftStatusEl.innerHTML = '';
-      previewSection.style.display = 'none';
-      publishStatusEl.innerHTML = '';
-      saveStatusEl.innerHTML = '';
-      confirmPublishCheckbox.checked = false;
-      confirmPublishCheckbox.disabled = false;
-      publishButton.disabled = true;
-      currentUploadId = null;
-      currentImageCount = 0;
-      currentIdentification = null;
-      currentDraftResult = null;
+      resetItemFlowState();
+      currentBatch = null;
+      currentItemIndex = null;
+      menuSection.style.display = 'none';
+      itemDetailSection.style.display = 'none';
+      uploadSection.style.display = 'block';
 
-      if (files.length > MAX_IMAGES) {
-        statusEl.innerHTML = `<p class="error">Up to ${MAX_IMAGES} photos are allowed — you selected ${files.length}.</p>`;
+      if (files.length > MAX_BATCH_IMAGES) {
+        statusEl.innerHTML = `<p class="error">Up to ${MAX_BATCH_IMAGES} photos are allowed per upload — you selected ${files.length}.</p>`;
         return;
       }
       const oversized = files.find((f) => f.size > MAX_BYTES);
@@ -460,7 +569,7 @@
           if (!res.ok) throw new Error(errorMessage(data));
           return data;
         })
-        .then(showConfirmStep)
+        .then(showBatchMenu)
         .catch((err) => {
           statusEl.innerHTML = `<p class="error">${err.message}</p>`;
         })
@@ -490,15 +599,90 @@
       confirmItemButton.disabled = false;
     }
 
-    function showConfirmStep(data) {
-      currentUploadId = data.upload_id;
-      currentImageCount = data.image_count;
-      currentIdentification = null;
+    const ITEM_STATUS_LABEL = { not_started: 'Not started', in_progress: 'In progress', published: 'Published' };
+
+    function showBatchMenu(data) {
+      currentBatch = {
+        uploadId: data.upload_id,
+        imageCount: data.image_count,
+        items: data.items.map((item) => ({ ...item, status: 'not_started' })),
+      };
       statusEl.innerHTML = '';
-      confirmItemNameInput.value = data.item_name;
-      populateCategorySelect(data.category_suggestions);
-      confirmSection.style.display = 'block';
+      uploadSection.style.display = 'none';
+      menuSection.style.display = 'block';
+      menuIntroEl.textContent = `${currentBatch.imageCount} photo${currentBatch.imageCount === 1 ? '' : 's'} grouped into ${currentBatch.items.length} item${currentBatch.items.length === 1 ? '' : 's'} — pick one to finish listing it.`;
+      renderMenu();
     }
+
+    function renderMenu() {
+      menuListEl.innerHTML = currentBatch.items.map((item, i) => {
+        const thumbUrl = currentPreviewThumbUrls[item.photo_indices[0]] || '';
+        const photoCount = item.photo_indices.length;
+        return `
+          <div class="item-card">
+            ${thumbUrl ? `<img src="${thumbUrl}" alt="${escapeHtml(item.item_name)}">` : ''}
+            <p class="item-card-name">${escapeHtml(item.item_name)}</p>
+            <p class="item-card-category">${escapeHtml(item.category)}</p>
+            <p class="item-card-photos">${photoCount} photo${photoCount === 1 ? '' : 's'}</p>
+            <span class="item-card-status status-${item.status}">${ITEM_STATUS_LABEL[item.status]}</span>
+            <button data-item-index="${i}" class="open-item-button">${item.status === 'published' ? 'View' : 'Work on this item'}</button>
+          </div>
+        `;
+      }).join('');
+    }
+
+    menuListEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('.open-item-button');
+      if (btn) openItem(parseInt(btn.dataset.itemIndex, 10));
+    });
+
+    newBatchButton.addEventListener('click', () => {
+      currentBatch = null;
+      currentItemIndex = null;
+      currentPreviewThumbUrls = [];
+      previewThumbsEl.innerHTML = '';
+      previewThumbsEl.style.display = 'none';
+      fileInput.value = '';
+      menuSection.style.display = 'none';
+      uploadSection.style.display = 'block';
+      statusEl.innerHTML = '';
+    });
+
+    function openItem(itemIndex) {
+      currentItemIndex = itemIndex;
+      const item = currentBatch.items[itemIndex];
+      resetItemFlowState();
+      menuSection.style.display = 'none';
+      itemDetailSection.style.display = 'block';
+      confirmItemNameInput.value = item.item_name;
+      confirmSection.style.display = 'block';
+      categorySelect.innerHTML = '<option disabled selected>Loading categories…</option>';
+
+      // Reuses the existing re-search endpoint with the clustering call's rough
+      // category guess as the query — the same Taxonomy lookup /api/identify used to
+      // do inline for a single item, now deferred until the user actually opens this
+      // one, since not every item in a batch necessarily gets worked on in one sitting.
+      fetch('/api/categories/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: item.category }),
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(errorMessage(data));
+          return data;
+        })
+        .then((data) => populateCategorySelect(data.result.suggestions))
+        .catch((err) => {
+          confirmStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
+        });
+    }
+
+    backToMenuButton.addEventListener('click', () => {
+      itemDetailSection.style.display = 'none';
+      menuSection.style.display = 'block';
+      renderMenu();
+    });
 
     categorySearchButton.addEventListener('click', () => {
       const query = categorySearchInput.value.trim();
@@ -549,15 +733,16 @@
       confirmItemButton.disabled = true;
       confirmStatusEl.textContent = 'Analyzing item…';
 
+      const currentItem = currentBatch.items[currentItemIndex];
       fetch('/api/identify/confirm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          upload_id: currentUploadId,
+          upload_id: currentBatch.uploadId,
           item_name: itemName,
           category_id: categoryId,
           category_name: categoryName,
-          image_count: currentImageCount,
+          photo_indices: currentItem.photo_indices,
         }),
       })
         .then(async (res) => {
@@ -568,7 +753,8 @@
         .then((data) => {
           confirmSection.style.display = 'none';
           currentIdentification = data.result;
-          statusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
+          currentItem.status = 'in_progress';
+          itemStatusEl.innerHTML = `<pre>${JSON.stringify(data.result, null, 2)}</pre>`;
           fetchComparableListings();
         })
         .catch((err) => {
@@ -620,7 +806,7 @@
     }
 
     draftButton.addEventListener('click', () => {
-      if (!currentIdentification || !currentUploadId) return;
+      if (!currentIdentification || !currentBatch) return;
 
       // Price/weight aren't needed by this call (it only resolves category/condition/
       // aspects/policies — nothing is created on eBay yet, see app.py), but validating
@@ -642,7 +828,7 @@
       fetch('/api/listing/draft', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identification: currentIdentification, upload_id: currentUploadId }),
+        body: JSON.stringify({ identification: currentIdentification, upload_id: currentBatch.uploadId }),
       })
         .then(async (res) => {
           const data = await res.json();
@@ -668,9 +854,10 @@
     // a draft is first created. Not called again after Save Changes, since at that point
     // the fields already show exactly what was just saved.
     function populateEditForm(identification, categoryQuery) {
-      previewListingImg.src = currentPreviewThumbUrls[0] || '';
-      previewPhotoCountEl.textContent = currentImageCount > 1
-        ? `Showing photo 1 of ${currentImageCount} — all ${currentImageCount} will be attached to the listing.`
+      const photoIndices = currentBatch.items[currentItemIndex].photo_indices;
+      previewListingImg.src = currentPreviewThumbUrls[photoIndices[0]] || '';
+      previewPhotoCountEl.textContent = photoIndices.length > 1
+        ? `Showing photo 1 of ${photoIndices.length} — all ${photoIndices.length} will be attached to the listing.`
         : '';
       editTitle.value = identification.item_name;
       editBrand.value = identification.brand || '';
@@ -731,7 +918,7 @@
     }
 
     saveChangesButton.addEventListener('click', () => {
-      if (!currentDraftResult || !currentUploadId) return;
+      if (!currentDraftResult || !currentBatch) return;
 
       const price = parseFloat(priceInput.value);
       if (!(price > 0)) {
@@ -752,12 +939,12 @@
       saveChangesButton.disabled = true;
       saveStatusEl.textContent = 'Re-resolving category, condition, and item specifics…';
 
-      fetch(`/api/listing/draft/${currentUploadId}/update`, {
+      fetch(`/api/listing/draft/${currentBatch.uploadId}/update`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           identification: updatedIdentification,
-          upload_id: currentUploadId,
+          upload_id: currentBatch.uploadId,
           category_query: editCategoryQuery.value.trim() || null,
         }),
       })
@@ -786,7 +973,7 @@
     });
 
     publishButton.addEventListener('click', () => {
-      if (!currentDraftResult || !currentUploadId || !confirmPublishCheckbox.checked) return;
+      if (!currentDraftResult || !currentBatch || !confirmPublishCheckbox.checked) return;
 
       const price = parseFloat(priceInput.value);
       if (!(price > 0)) {
@@ -808,7 +995,8 @@
       confirmPublishCheckbox.disabled = true;
       publishStatusEl.textContent = 'Publishing to eBay — this will make the listing live…';
 
-      fetch(`/api/listing/publish/${currentUploadId}`, {
+      const currentItem = currentBatch.items[currentItemIndex];
+      fetch(`/api/listing/publish/${currentBatch.uploadId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -816,7 +1004,8 @@
           price,
           weight_lbs: weightLbs,
           currency: 'USD',
-          image_count: currentImageCount,
+          photo_indices: currentItem.photo_indices,
+          item_index: currentItem.item_index,
         }),
       })
         .then(async (res) => {
@@ -826,6 +1015,7 @@
         })
         .then((data) => {
           const r = data.result;
+          currentItem.status = 'published';
           publishStatusEl.innerHTML = `<p><strong>Live.</strong> Your listing is now public and purchasable: <a href="${r.listing_url}" target="_blank" rel="noopener">${r.listing_url}</a></p>`;
         })
         .catch((err) => {
