@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -10,13 +11,13 @@ from typing import Callable, TypeVar
 
 import anthropic
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageCms, UnidentifiedImageError
 from pydantic import BaseModel
 
-from src.agents.vision_subagent import ItemCluster, ProductIdentification, VisionSubagent
+from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, get_application_access_token, load_ebay_browse_config, search_comparable_listings
 from src.ebay.config import load_ebay_config
 from src.ebay.listing import EbayTradingApiError, create_listing, get_required_aspects, resolve_draft_listing, suggest_categories
@@ -36,27 +37,21 @@ T = TypeVar("T")
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 # The whole batch a single /api/identify call accepts, potentially spanning several
-# different items — Claude clusters them by item (see cluster_items() below) before
-# anything else happens. Bounded because the clustering call sends every photo in the
-# batch to Claude in one message; unbounded would mean unbounded cost/context per
-# upload.
+# different items — the user splits them into items client-side (see index.html's
+# split-divider UI) before uploading, so this is just an overall sanity cap on request
+# size, not tied to any per-call Claude cost the way it was when clustering was
+# AI-driven.
 MAX_BATCH_IMAGES = 60
 # eBay's own real per-listing limit (confirmed against eBay's docs: AddFixedPriceItem
 # accepts up to 24 self-hosted PictureURLs) — enforced defensively at publish time
-# (see publish_listing_route() below), not at upload time, since how many photos end
-# up clustered into one item isn't known until after cluster_items() runs.
+# (see publish_listing_route() below), not at upload time, since the user could in
+# principle put more than 24 photos in one split group.
 MAX_ITEM_IMAGES = 24
 # Only the first MAX_ANALYSIS_IMAGES of *one item's* photos are sent to Claude's
-# identify() call, independent of how many photos that item ends up with — a handful
-# of angles is enough to identify an item, and analyzing all of them would multiply
-# vision-call cost for little added benefit.
+# preview()/identify() calls, independent of how many photos that item ends up with —
+# a handful of angles is enough to identify an item, and analyzing all of them would
+# multiply vision-call cost for little added benefit.
 MAX_ANALYSIS_IMAGES = 5
-# Longest side, in pixels, for the separate thumbnail set built just for the batch
-# clustering call (see _thumbnail_for_clustering() below) — distinct from
-# EBAY_MAX_IMAGE_DIMENSION below, since clustering only needs enough resolution to
-# visually distinguish items, not eBay-listing quality, and a batch can be up to
-# MAX_BATCH_IMAGES full images in one Claude message.
-CLUSTERING_THUMBNAIL_SIZE = 512
 # eBay's own image requirements: below 500px on either dimension, "the listing may be
 # blocked" — silently, not with a clean rejection at listing-creation time, which is
 # exactly the "image not showing up" failure mode this guards against.
@@ -177,46 +172,6 @@ def _read_and_normalize_upload(file: UploadFile) -> bytes:
     return _validate_and_normalize_image(contents)
 
 
-def _thumbnail_for_clustering(image_bytes: bytes) -> bytes:
-    """Downscales an already-normalized (eBay-quality, up to 1600px) image to a small
-    thumbnail just for the batch clustering call — a batch can be up to MAX_BATCH_IMAGES
-    full images, and clustering only needs enough resolution to visually tell items
-    apart, not eBay-listing quality. The original normalized bytes (not this thumbnail)
-    are what's actually uploaded to Supabase and later analyzed per-item."""
-    image = Image.open(io.BytesIO(image_bytes))
-    image.thumbnail((CLUSTERING_THUMBNAIL_SIZE, CLUSTERING_THUMBNAIL_SIZE), Image.LANCZOS)
-    buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=70)
-    return buf.getvalue()
-
-
-def _normalize_clusters(clusters: list[ItemCluster], total: int) -> list[ItemCluster]:
-    """Validates/repairs Claude's clustering output before it's trusted: drops
-    out-of-range indices, dedupes (first assignment wins), and appends any photo index
-    Claude never assigned as its own singleton item — so every uploaded photo always
-    ends up belonging to exactly one item, never silently dropped. Falls back to one
-    cluster containing every photo if Claude's output is unusable (e.g. empty), rather
-    than failing the whole upload.
-    """
-    seen: set[int] = set()
-    repaired: list[ItemCluster] = []
-    for cluster in clusters:
-        indices = [i for i in cluster.photo_indices if 0 <= i < total and i not in seen]
-        if not indices:
-            continue
-        seen.update(indices)
-        repaired.append(ItemCluster(photo_indices=indices, item_name=cluster.item_name, category=cluster.category))
-
-    missing = [i for i in range(total) if i not in seen]
-    for i in missing:
-        repaired.append(ItemCluster(photo_indices=[i], item_name="Unidentified Item", category="Other"))
-
-    if not repaired:
-        repaired = [ItemCluster(photo_indices=list(range(total)), item_name="Unidentified Item", category="Other")]
-
-    return repaired
-
-
 def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
     """Run a Claude-backed subagent call, translating transient API failures into clean HTTP errors."""
     try:
@@ -273,23 +228,39 @@ def _fetch_image(url: str) -> bytes:
 
 
 @app.post("/api/identify")
-def identify(files: list[UploadFile] = File(...)) -> dict:
+def identify(files: list[UploadFile] = File(...), group_sizes: str = Form(...)) -> dict:
     """Uploads a whole batch of photos — potentially several different items in one
-    session — and groups them by distinct physical item. Never runs the full analysis;
-    the user picks one detected item at a time from the resulting menu and confirms/
-    edits its name+category via POST /api/identify/confirm before brand/model/
-    condition/description get analyzed at all (see that route below).
+    session — already split into per-item groups by the user (the frontend's
+    split-divider UI, see index.html: photos load in a sequential strip and the user
+    taps between two photos to mark an item boundary; automatic Claude-based clustering
+    was tried first and replaced per explicit direction — it didn't group reliably
+    enough to trust). Never runs the full analysis; the user picks one item at a time
+    from the resulting menu and confirms/edits its name+category via
+    POST /api/identify/confirm before brand/model/condition/description get analyzed
+    at all (see that route below).
 
-    Accepts up to MAX_BATCH_IMAGES photos total. Every photo is uploaded to Supabase
-    regardless of which item it ends up clustered into (all of them get attached to
-    their item's eBay listing at publish time — see src/ebay/listing.py's
-    create_listing()); clustering itself runs on a separate, smaller thumbnail set
-    (see _thumbnail_for_clustering()) to keep that one Claude call's cost bounded.
+    `group_sizes` is a JSON-encoded array of positive integers (e.g. "[3, 2, 4]")
+    giving each item's photo count, in the same order as `files` — since splits only
+    ever divide the sequential upload order, not reorder it, contiguous ranges are
+    always enough to describe a group; there's no need for arbitrary index lists the
+    way an AI-clustering result would have needed.
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one photo is required.")
     if len(files) > MAX_BATCH_IMAGES:
         raise HTTPException(status_code=400, detail=f"Up to {MAX_BATCH_IMAGES} photos are allowed per upload.")
+
+    try:
+        sizes = json.loads(group_sizes)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="group_sizes must be valid JSON.")
+    if not isinstance(sizes, list) or not sizes or any(not isinstance(s, int) or s < 1 for s in sizes):
+        raise HTTPException(status_code=400, detail="group_sizes must be a non-empty JSON array of positive integers.")
+    if sum(sizes) != len(files):
+        raise HTTPException(
+            status_code=400,
+            detail=f"group_sizes sums to {sum(sizes)}, but {len(files)} photos were uploaded.",
+        )
 
     # Validate/normalize every file into memory *before* uploading any of them, so a
     # single bad file (e.g. too small) aborts cleanly with nothing partially written to
@@ -305,23 +276,24 @@ def identify(files: list[UploadFile] = File(...)) -> dict:
     for i, image_bytes in enumerate(normalized_images):
         _call_storage(upload_image, storage_config, upload_id, i, image_bytes)
 
-    clustering_images = [(_thumbnail_for_clustering(b), "image/jpeg") for b in normalized_images]
-    cluster_result = _call_claude(_vision_subagent.cluster_items, clustering_images)
-    items = _normalize_clusters(cluster_result.items, len(files))
+    # One cheap preview() call per item (not one big call over the whole batch, now
+    # that grouping is the user's own manual input rather than something Claude has to
+    # figure out) — gives each menu card a real name/category guess instead of a
+    # placeholder. Sequential, matching this codebase's style elsewhere.
+    items = []
+    offset = 0
+    for size in sizes:
+        photo_indices = list(range(offset, offset + size))
+        offset += size
+        analysis_images = [(normalized_images[i], "image/jpeg") for i in photo_indices[:MAX_ANALYSIS_IMAGES]]
+        preview = _call_claude(_vision_subagent.preview, analysis_images)
+        items.append({"photo_indices": photo_indices, "item_name": preview.item_name, "category": preview.category})
 
     return {
         "status": "batch_preview",
         "upload_id": upload_id,
         "image_count": len(files),
-        "items": [
-            {
-                "item_index": idx,
-                "photo_indices": item.photo_indices,
-                "item_name": item.item_name,
-                "category": item.category,
-            }
-            for idx, item in enumerate(items)
-        ],
+        "items": [{"item_index": idx, **item} for idx, item in enumerate(items)],
     }
 
 

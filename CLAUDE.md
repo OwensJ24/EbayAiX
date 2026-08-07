@@ -11,16 +11,27 @@ Agentic Search, and AI Governance (Human-in-the-Loop controls) as resume-relevan
 reflect deliberate, enterprise-style patterns rather than the shortest path to a working demo.
 
 So far: batch photo upload (up to 60 photos in one session, spanning as many physical items as the user is
-listing at once) with Claude automatically grouping photos by which item they show, a menu screen to pick one
-detected item at a time, a two-phase Claude-based structured identification per item (a cheap name+category
-guess, confirmed/corrected by a human, then a fuller analysis informed by that confirmation and by eBay's own
-required item-specifics for the confirmed category), a low-cost eBay comparable-listings lookup (no LLM
-involved), real eBay listing creation via the legacy Trading API (`AddFixedPriceItem`, with every one of that
-item's uploaded photos attached, up to eBay's real 24-photo-per-listing limit), an in-app listing preview +
-explicit publish step, a FastAPI front end chaining all of it together, and an eBay OAuth 2.0 connect flow.
-The Claude-based orchestrator tying these steps together programmatically, and a more general HITL approval
-gate, are still future work (see "Planned architecture") — but both the mandatory identify/confirm step and
-the in-app review-then-publish flow already built are this project's concrete instances of that gate.
+listing at once) with an interactive split-divider UI for the user to manually group photos by item, a menu
+screen to pick one item at a time, a two-phase Claude-based structured identification per item (a cheap
+name+category guess, confirmed/corrected by a human, then a fuller analysis informed by that confirmation and
+by eBay's own required item-specifics for the confirmed category), a low-cost eBay comparable-listings lookup
+(no LLM involved), real eBay listing creation via the legacy Trading API (`AddFixedPriceItem`, with every one
+of that item's uploaded photos attached, up to eBay's real 24-photo-per-listing limit), an in-app listing
+preview + explicit publish step, a FastAPI front end chaining all of it together, and an eBay OAuth 2.0
+connect flow. The Claude-based orchestrator tying these steps together programmatically, and a more general
+HITL approval gate, are still future work (see "Planned architecture") — but both the mandatory
+identify/confirm step and the in-app review-then-publish flow already built are this project's concrete
+instances of that gate.
+
+**Item grouping is manual, not AI-driven — this was tried the other way and reverted per explicit
+direction.** An earlier version of this feature sent the whole photo batch to Claude in one call
+(`cluster_items()`, since removed) to automatically group photos by physical item. It didn't group reliably
+enough to trust — a real, observed failure mode, not a hypothetical — so it was replaced with the "Interactive
+Split Dividers" pattern in `index.html`: photos load in a single sequential strip, in the order the user added
+them, and the user taps the space between any two photos to toggle an item boundary there. This is both
+simpler (no clustering call, no need to validate/repair an LLM's grouping output) and more reliable (the
+human, not a model, decides where one item's photos end and the next begins) — a deliberate trade of one more
+manual step for correctness the AI approach couldn't reach.
 
 **Important finding that shaped the publish flow, and later reshaped it again:** this project originally
 created listings via eBay's newer Inventory API (`createOrReplaceInventoryItem` + `createOffer` +
@@ -96,8 +107,8 @@ serverless platforms (Vercel, etc.) because the file-based token/location storag
 - **`ENV MALLOC_ARENA_MAX=1`** caps glibc to a single malloc arena, which reliably releases freed memory back
   to the OS (unlike the multi-arena default, a well-known cause of RSS ratcheting upward across requests
   rather than resetting) — worthwhile on Render's free-tier 512MB limit given this app can process up to
-  MAX_BATCH_IMAGES (60) photos per identify request (Pillow resize/convert + base64-encoding for Claude
-  vision calls, both for per-item analysis and the whole-batch clustering call).
+  MAX_BATCH_IMAGES (60) photos per identify request (Pillow resize/convert + one base64-encoded Claude
+  `preview()` call per user-defined item group — see the Architecture section below).
 - **uvicorn is started with `--proxy-headers --forwarded-allow-ips='*'`.** Render terminates TLS at its edge
   and forwards plain HTTP internally, so without trusting `X-Forwarded-Proto`, `request.base_url` (used by
   `_public_base_url()` in `app.py` to build the `imageUrls` eBay fetches) silently resolves to `http://`
@@ -125,24 +136,14 @@ listings search, eBay category-specific condition/aspect rules, buyer discoverab
 overhead — Claude's own vision analysis is what actually drives identification); both phases take one or
 more photos directly.
 
-`VisionSubagent.cluster_items(images) -> BatchClusterResult` — the actual entry point `POST /api/identify`
-calls now (see `app.py` below): groups a whole batch of photos (up to `MAX_BATCH_IMAGES`) by distinct
-physical item in one Claude call, before any per-item analysis happens. Returns `BatchClusterResult.items: list[ItemCluster]`, each with `photo_indices` (0-based indices into the photos as provided, not necessarily
-contiguous or ordered — the same item can span non-adjacent photos), plus a quick `item_name`/`category`
-guess for that item, same shape as `preview()`'s output. The system prompt is explicit that every index from
-0 to N-1 must end up in exactly one group and none may be skipped or duplicated — but `app.py`'s
-`_normalize_clusters()` still defensively validates/repairs the result rather than trusting it outright (see
-below), since this is exactly the kind of constraint an LLM can plausibly get wrong on a large batch.
-
-`VisionSubagent.preview(images: list[tuple[bytes, str]]) -> ItemPreview` — the same kind of cheap first pass
-(`max_tokens=256`, `item_name` + a free-text `category` guess) as `cluster_items()` produces per-item, but
-for a single already-known item; kept as a separate method since the CLI (`main()` below) and any future
-single-item use still want it without going through batch clustering. `images` is a list of `(image_bytes,
-media_type)` pairs, each turned into its own `{"type": "image", ...}` content block in a single Claude
-message — Claude supports several images per message natively, so multiple angles of the same item (including
-a tag or label photo) are examined together rather than one at a time. Not currently called anywhere in the
-web app's own flow (clustering produces the per-item name+category guess instead); the result is never used
-directly for listing creation regardless of caller, only to seed a confirm-step UI.
+`VisionSubagent.preview(images: list[tuple[bytes, str]]) -> ItemPreview` — a cheap first pass (`max_tokens=256`)
+that returns only `item_name` + a free-text `category` guess. `images` is a list of `(image_bytes, media_type)`
+pairs, each turned into its own `{"type": "image", ...}` content block in a single Claude message — Claude
+supports several images per message natively, so multiple angles of the same item (including a tag or label
+photo) are examined together rather than one at a time. `POST /api/identify` (see `app.py` below) calls this
+once per item group the user defines via the split-divider UI — one call per group, not one call over the
+whole batch — using the first `MAX_ANALYSIS_IMAGES` of that group's photos; the result seeds that item's menu
+card (name + category) and is never used directly for listing creation.
 
 `VisionSubagent.identify(images, confirmed_item_name, confirmed_category, required_aspects=None) ->
 ProductIdentification` — the fuller analysis, only ever run *after* a human has confirmed/edited the name and
@@ -195,54 +196,57 @@ read-only, public-data search with no side effects, so production credentials he
 that using production for listing creation would.
 
 **`src/web/app.py`** — the FastAPI front end. `POST /api/identify` accepts a whole *batch* of photos in one
-request — up to `MAX_BATCH_IMAGES` (60), potentially spanning several different physical items
+request — up to `MAX_BATCH_IMAGES` (60), already split into per-item groups by the user (the frontend's
+split-divider UI — see below) before this route is ever called
 (`files: list[UploadFile]` — FastAPI's native multi-file support, matched by repeated `files` fields in the
 frontend's `FormData`; the field name must match the parameter name exactly, since that's how FastAPI maps
-multipart fields — a real bug hit during development when the frontend used `'file'` instead). Every file is
-read, extension-allowlisted (jpg/jpeg/png/webp — all formats eBay accepts, confirmed against eBay's own
-docs), size-capped at 10MB, and validated/normalized *entirely in memory* via `_validate_and_normalize_image()`
-— rejects anything under `EBAY_MIN_IMAGE_DIMENSION` (500px) on either side with a clear 400 (eBay's own docs
-say a smaller image "may be blocked" from the listing, silently, which is a worse failure mode than rejecting
-it up front), and **downscales anything over `EBAY_MAX_IMAGE_DIMENSION` (1600px, matching eBay's own
-"preferably at least 1600x1600" guidance) to 1600px on its longest side, always re-encoding as JPEG regardless
-of original format.** This exists because full-resolution modern phone photos (4000px+, several MB),
-multiplied by up to `MAX_BATCH_IMAGES` per upload, were plausibly large enough to push a request past Render's
-free-tier timeout or memory limit — the observed symptom was a bare 502 with **zero** matching Render log
-output (the request died mid-flight, before this app's own logging/error handling ever ran), a much less
-diagnosable failure mode than this app's normal 4xx/502/503 JSON responses. *Every* file is validated/normalized
-before *any* of them are uploaded, so one bad photo aborts the whole request cleanly rather than leaving a
-partial set in Supabase. Each normalized image is then uploaded to **Supabase Storage**
-(`src/storage/supabase_storage.py`, see below) at `{upload_id}/{index}.jpg` regardless of which item it turns
-out to belong to — clustering (next) only determines how photos are *grouped*, not whether they're stored.
+multipart fields — a real bug hit during development when the frontend used `'file'` instead — plus a
+`group_sizes: str` form field, a JSON-encoded array of positive integers like `"[3, 2, 4]"` giving each item's
+photo count, in the same order as `files`; validated to sum to exactly the number of uploaded files). Every
+file is read, extension-allowlisted (jpg/jpeg/png/webp — all formats eBay accepts, confirmed against eBay's
+own docs), size-capped at 10MB, and validated/normalized *entirely in memory* via
+`_validate_and_normalize_image()` — rejects anything under `EBAY_MIN_IMAGE_DIMENSION` (500px) on either side
+with a clear 400 (eBay's own docs say a smaller image "may be blocked" from the listing, silently, which is a
+worse failure mode than rejecting it up front), and **downscales anything over `EBAY_MAX_IMAGE_DIMENSION`
+(1600px, matching eBay's own "preferably at least 1600x1600" guidance) to 1600px on its longest side, always
+re-encoding as JPEG regardless of original format.** This exists because full-resolution modern phone photos
+(4000px+, several MB), multiplied by up to `MAX_BATCH_IMAGES` per upload, were plausibly large enough to push
+a request past Render's free-tier timeout or memory limit — the observed symptom was a bare 502 with **zero**
+matching Render log output (the request died mid-flight, before this app's own logging/error handling ever
+ran), a much less diagnosable failure mode than this app's normal 4xx/502/503 JSON responses. *Every* file is
+validated/normalized before *any* of them are uploaded, so one bad photo aborts the whole request cleanly
+rather than leaving a partial set in Supabase. Each normalized image is then uploaded to **Supabase Storage**
+(`src/storage/supabase_storage.py`, see below) at `{upload_id}/{index}.jpg`.
 
-**Clustering, not a single preview() guess, is what `/api/identify` actually runs.** A separate, smaller
-thumbnail set is built just for this one call — `_thumbnail_for_clustering()` downscales each already-
-normalized image to `CLUSTERING_THUMBNAIL_SIZE` (512px) — since a batch can be up to 60 full-resolution
-images and clustering only needs enough detail to visually tell items apart, not eBay-listing quality.
-`VisionSubagent.cluster_items()` (see `vision_subagent.py` above) runs on that thumbnail set and returns a
-list of `ItemCluster`s. Its output is then passed through `_normalize_clusters()` — a defensive repair pass,
-not just a pass-through: drops any out-of-range photo index, dedupes (first assignment wins), and appends any
-photo index Claude never assigned as its own singleton item, so every uploaded photo always ends up belonging
-to exactly one item, never silently dropped. If Claude's clustering response is entirely unusable (e.g.
-empty), falls back to one cluster containing every photo rather than failing the whole upload. Returns
-`{status: "batch_preview", upload_id, image_count, items: [{item_index, photo_indices, item_name, category}, ...]}`
-— `item_index` is just each item's 0-based position in this list, but it matters later: since several items
-now share one `upload_id`, it's what keeps their eBay SKUs from colliding at publish time (see `listing.py`'s
-`generate_sku()` below). No Taxonomy call happens here — category suggestions are fetched lazily, only once
-the user actually opens a given item (see `POST /api/categories/search` below), since not every item in a
-batch necessarily gets worked on in the same sitting.
+**Grouping is the user's own input, not something this route figures out.** Since splits only ever divide the
+sequential upload order (the user can't reorder photos, only mark boundaries between them), each item's
+`photo_indices` is always a contiguous range — `group_sizes` is walked to build them
+(`[3, 2]` -> item 0 gets `[0,1,2]`, item 1 gets `[3,4]`). For each item, one `VisionSubagent.preview()` call
+(see `vision_subagent.py` above) runs over that item's first `MAX_ANALYSIS_IMAGES` photos to seed its menu
+card with a real name/category guess — one cheap call per item, not one large call over the whole batch,
+which is both simpler and, in aggregate, usually cheaper than the AI-clustering approach this replaced (that
+one call had to examine the entire batch at once; N small calls each only look at one item's own handful of
+photos). Returns `{status: "batch_preview", upload_id, image_count, items: [{item_index, photo_indices,
+item_name, category}, ...]}` — `item_index` is just each item's 0-based position in this list, but it matters
+later: since several items now share one `upload_id`, it's what keeps their eBay SKUs from colliding at
+publish time (see `listing.py`'s `generate_sku()` below). No Taxonomy call happens here — category
+suggestions are fetched lazily, only once the user actually opens a given item (see
+`POST /api/categories/search` below), since not every item in a batch necessarily gets worked on in the same
+sitting.
 
 **`POST /api/categories/search`** — the same `suggest_categories()` call `/api/identify` used to run inline
-for its single item before clustering existed; now reused for two things: the frontend's re-search box when
+for its single item before batch upload existed; now reused for two things: the frontend's re-search box when
 none of the initial suggestions fit, *and* the first thing that happens when a user opens an item from the
-batch menu (using that item's rough `category` guess from clustering as the query, to populate its category
-dropdown).
+batch menu (using that item's rough `category` guess from its `preview()` call as the query, to populate its
+category dropdown).
 
 **`POST /api/identify/confirm`** (this used to be `/api/identify/refine`, with a materially different
 contract — renamed since it's no longer "refine a low-confidence guess" but "run the full analysis now that
 name+category are confirmed"). Body: `{upload_id, item_name, category_id, category_name, photo_indices}` —
-all mandatory, never optional. `photo_indices` (not a contiguous range — see clustering above) identifies
-*this item's* photos within the shared batch; since this is a separate HTTP request from `/api/identify` with
+all mandatory, never optional. `photo_indices` identifies *this item's* photos within the shared batch (in
+practice always a contiguous range — see the split-divider grouping above — but the field itself is a plain
+index list, not a range, so nothing downstream needs to assume contiguity); since this is a separate HTTP
+request from `/api/identify` with
 no server-side session state, it re-fetches the first `photo_indices[:MAX_ANALYSIS_IMAGES]` via `httpx.get()`
 on their already-uploaded Supabase public URLs (same pattern `create_listing()` in `listing.py` uses to
 re-fetch an image before EPS upload) rather than keeping anything in memory across requests. It also fetches
@@ -408,7 +412,7 @@ eBay categories rather than trusting one guess.
 create-vs-update distinction anymore, since there's nothing on eBay to create or update yet; both routes just
 re-run the same dry run against whatever `ProductIdentification` the frontend currently has). `create_listing()`
 takes `upload_id` *and* `item_index` — since one `upload_id` can now be a whole batch shared across several
-items (see `app.py` above), `item_index` (that item's 0-based position in the clustering response) is what
+items (see `app.py` above), `item_index` (that item's 0-based position in `/api/identify`'s response) is what
 `generate_sku(upload_id, item_index) -> f"agentx-{upload_id}-{item_index}"` uses to keep two items published
 from the same batch from colliding on the same eBay SKU. For every photo in `image_urls` (already sliced to
 `MAX_ITEM_IMAGES` by `app.py`'s publish route as a defensive cap), fetches the Supabase-hosted bytes and
@@ -529,9 +533,9 @@ not just before the one eBay write) is still future work if the project's scope 
   publish latency scales roughly linearly with photo count (up to `MAX_ITEM_IMAGES` = 24) — acceptable given
   this project's scale, and consistent with the rest of the codebase never using concurrent HTTP calls, but
   worth revisiting (e.g. `httpx.AsyncClient` + `asyncio.gather`) if publish latency becomes a real UX problem.
-- The whole batch — clustering results, each item's `photo_indices`, and every item's `status` (not
+- The whole batch — the split-divider grouping, each item's `photo_indices`, and every item's `status` (not
   started/in progress/published) — lives entirely in the frontend's `currentBatch` JS state, with no
-  server-side session store. A page refresh loses the whole batch, requiring a full re-upload and re-cluster;
+  server-side session store. A page refresh loses the whole batch, requiring a full re-upload and re-split;
   this was already true for a single item before this feature, just now scaled up to potentially several
   items' worth of in-progress work.
 - Condition validity is checked dynamically per category (`resolve_condition()`, see above) rather than

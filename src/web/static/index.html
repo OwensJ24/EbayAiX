@@ -42,19 +42,57 @@
       white-space: pre-wrap;
     }
 
-    #previewThumbs {
-      display: none;
-      flex-wrap: wrap;
-      gap: 0.5rem;
+    .split-strip {
+      display: flex;
+      align-items: flex-end;
+      overflow-x: auto;
+      padding: 0.5rem 0 1rem;
       margin-top: 1rem;
     }
 
-    #previewThumbs img {
-      width: 100px;
-      height: 100px;
+    .split-item {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .split-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: #333;
+      white-space: nowrap;
+      margin-bottom: 0.25rem;
+      min-height: 1em;
+    }
+
+    .split-thumb {
+      width: 90px;
+      height: 90px;
       object-fit: cover;
       border-radius: 6px;
       border: 1px solid #ccc;
+    }
+
+    .split-divider {
+      flex: 0 0 auto;
+      align-self: flex-end;
+      width: 28px;
+      height: 90px;
+      margin: 0 3px;
+      border: none;
+      border-radius: 4px;
+      background: #f0f0f0;
+      color: #888;
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+    }
+
+    .split-divider.active {
+      background: #fdeaea;
+      color: #d9534f;
+      font-weight: 700;
     }
 
     .error {
@@ -278,18 +316,25 @@
 
   <div id="uploadSection">
     <p>Upload all the photos for however many items you're listing in this session —
-      JPEG/PNG/WEBP, up to 10MB each, up to 60 total. Claude groups them by which
-      physical item each photo shows, then you'll pick one item at a time to finish
-      listing. Include a tag or label photo for an item if it shows details like size
-      that aren't visible elsewhere.</p>
+      JPEG/PNG/WEBP, up to 10MB each, up to 60 total. You'll split them into separate
+      listings on the next screen. Include a tag or label photo for an item if it shows
+      details like size that aren't visible elsewhere.</p>
 
     <div id="dropzone">
       <p>Click to choose photos, or drag them here</p>
       <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
     </div>
 
-    <div id="previewThumbs"></div>
     <div id="status"></div>
+  </div>
+
+  <div id="splitSection" style="display:none;">
+    <p>Photos are shown in the order you added them. Tap the divider between two photos
+      to split them into separate listings, or tap an active divider to merge them back
+      together.</p>
+    <div id="splitStrip" class="split-strip"></div>
+    <button id="splitContinueButton">Continue</button>
+    <div id="splitStatus"></div>
   </div>
 
   <div id="menuSection" style="display:none;">
@@ -376,8 +421,11 @@
     const uploadSection = document.getElementById('uploadSection');
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
-    const previewThumbsEl = document.getElementById('previewThumbs');
     const statusEl = document.getElementById('status');
+    const splitSection = document.getElementById('splitSection');
+    const splitStripEl = document.getElementById('splitStrip');
+    const splitContinueButton = document.getElementById('splitContinueButton');
+    const splitStatusEl = document.getElementById('splitStatus');
     const menuSection = document.getElementById('menuSection');
     const menuIntroEl = document.getElementById('menuIntro');
     const menuListEl = document.getElementById('menuList');
@@ -426,6 +474,13 @@
     let currentIdentification = null;
     let currentDraftResult = null;
     let isUploading = false;
+
+    // Photos selected but not yet uploaded — held here while the user adjusts splits
+    // on the split-divider screen. splitAfter holds photo indices (0-based) after
+    // which an item boundary currently exists; e.g. {2, 4} for 6 photos means three
+    // listings: photos [0,1,2], [3,4], [5].
+    let pendingFiles = [];
+    let splitAfter = new Set();
 
     function escapeHtml(str) {
       const div = document.createElement('div');
@@ -530,8 +585,8 @@
     });
 
     function handleFiles(files) {
-      // Prevents piling up concurrent /api/identify requests (e.g. dragging several
-      // batches of images in quick succession).
+      // Prevents interfering with an in-flight /api/identify request (e.g. going back
+      // and picking a new batch of images while one's still uploading).
       if (isUploading) return;
 
       resetItemFlowState();
@@ -539,7 +594,9 @@
       currentItemIndex = null;
       menuSection.style.display = 'none';
       itemDetailSection.style.display = 'none';
+      splitSection.style.display = 'none';
       uploadSection.style.display = 'block';
+      statusEl.innerHTML = '';
 
       if (files.length > MAX_BATCH_IMAGES) {
         statusEl.innerHTML = `<p class="error">Up to ${MAX_BATCH_IMAGES} photos are allowed per upload — you selected ${files.length}.</p>`;
@@ -551,18 +608,76 @@
         return;
       }
 
+      // Nothing is uploaded yet — the split screen lets the user divide these photos
+      // into listings first (see splitContinueButton below, which does the actual
+      // upload once the user is happy with the grouping).
+      pendingFiles = files;
+      splitAfter = new Set();
       currentPreviewThumbUrls = files.map((f) => URL.createObjectURL(f));
-      previewThumbsEl.innerHTML = currentPreviewThumbUrls.map((url) => `<img src="${url}" alt="item photo">`).join('');
-      previewThumbsEl.style.display = 'flex';
 
+      uploadSection.style.display = 'none';
+      splitSection.style.display = 'block';
+      splitStatusEl.innerHTML = '';
+      renderSplitStrip();
+    }
+
+    // Turns splitAfter into an ordered list of contiguous photo-index groups — e.g.
+    // splitAfter={2,4} over 6 photos yields [[0,1,2],[3,4],[5]].
+    function computeSplitGroups() {
+      const n = pendingFiles.length;
+      const groups = [];
+      let current = [];
+      for (let i = 0; i < n; i++) {
+        current.push(i);
+        if (splitAfter.has(i) || i === n - 1) {
+          groups.push(current);
+          current = [];
+        }
+      }
+      return groups;
+    }
+
+    function renderSplitStrip() {
+      const n = pendingFiles.length;
+      const groups = computeSplitGroups();
+      const groupStartLabel = new Map();
+      groups.forEach((group, gi) => groupStartLabel.set(group[0], `Listing ${gi + 1}`));
+
+      let html = '';
+      for (let i = 0; i < n; i++) {
+        const label = groupStartLabel.get(i) || '';
+        html += `<div class="split-item"><div class="split-label">${escapeHtml(label)}</div><img class="split-thumb" src="${currentPreviewThumbUrls[i]}" alt="photo ${i + 1}"></div>`;
+        if (i < n - 1) {
+          const active = splitAfter.has(i);
+          html += `<button type="button" class="split-divider${active ? ' active' : ''}" data-index="${i}" title="${active ? 'Merge these back together' : 'Split into a new listing here'}">${active ? '✕' : '+'}</button>`;
+        }
+      }
+      splitStripEl.innerHTML = html;
+      splitContinueButton.textContent = `Continue with ${groups.length} listing${groups.length === 1 ? '' : 's'}`;
+    }
+
+    splitStripEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('.split-divider');
+      if (!btn) return;
+      const i = parseInt(btn.dataset.index, 10);
+      if (splitAfter.has(i)) splitAfter.delete(i); else splitAfter.add(i);
+      renderSplitStrip();
+    });
+
+    splitContinueButton.addEventListener('click', () => {
+      if (isUploading || !pendingFiles.length) return;
+
+      const groups = computeSplitGroups();
       const formData = new FormData();
       // Field name must match app.py's `files: list[UploadFile]` parameter name —
       // FastAPI matches multipart fields by parameter name, not by convention.
-      files.forEach((f) => formData.append('files', f));
+      pendingFiles.forEach((f) => formData.append('files', f));
+      formData.append('group_sizes', JSON.stringify(groups.map((g) => g.length)));
 
       isUploading = true;
-      dropzone.classList.add('busy');
-      statusEl.textContent = 'Identifying…';
+      splitContinueButton.disabled = true;
+      splitStatusEl.textContent = 'Uploading and identifying each listing…';
+
       fetch('/api/identify', { method: 'POST', body: formData })
         .then(async (res) => {
           const data = await res.json();
@@ -571,13 +686,13 @@
         })
         .then(showBatchMenu)
         .catch((err) => {
-          statusEl.innerHTML = `<p class="error">${err.message}</p>`;
+          splitStatusEl.innerHTML = `<p class="error">${err.message}</p>`;
         })
         .finally(() => {
           isUploading = false;
-          dropzone.classList.remove('busy');
+          splitContinueButton.disabled = false;
         });
-    }
+    });
 
     function populateCategorySelect(suggestions) {
       categorySelect.innerHTML = '';
@@ -609,8 +724,9 @@
       };
       statusEl.innerHTML = '';
       uploadSection.style.display = 'none';
+      splitSection.style.display = 'none';
       menuSection.style.display = 'block';
-      menuIntroEl.textContent = `${currentBatch.imageCount} photo${currentBatch.imageCount === 1 ? '' : 's'} grouped into ${currentBatch.items.length} item${currentBatch.items.length === 1 ? '' : 's'} — pick one to finish listing it.`;
+      menuIntroEl.textContent = `${currentBatch.imageCount} photo${currentBatch.imageCount === 1 ? '' : 's'} split into ${currentBatch.items.length} item${currentBatch.items.length === 1 ? '' : 's'} — pick one to finish listing it.`;
       renderMenu();
     }
 
@@ -640,10 +756,11 @@
       currentBatch = null;
       currentItemIndex = null;
       currentPreviewThumbUrls = [];
-      previewThumbsEl.innerHTML = '';
-      previewThumbsEl.style.display = 'none';
+      pendingFiles = [];
+      splitAfter = new Set();
       fileInput.value = '';
       menuSection.style.display = 'none';
+      splitSection.style.display = 'none';
       uploadSection.style.display = 'block';
       statusEl.innerHTML = '';
     });
