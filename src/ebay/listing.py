@@ -276,13 +276,22 @@ def resolve_aspects(
     never fabricates a plausible-sounding but made-up value (e.g. never guesses a
     color). Resolution order per aspect: (1) direct field match for Brand/Model, (2) a
     substring match of one of eBay's suggested values against the identification's own
-    text, (3) one of eBay's own "unknown" catch-all values if it offers one, (4) for
-    FREE_TEXT aspects only (no real enum to violate) an honest 'Not Specified'
-    placeholder. Only a genuinely unresolvable aspect with `required=True` ends up in
-    the returned `unresolved` list — an unresolvable *recommended* aspect (see
-    get_category_aspects()) is simply left out of the returned dict instead, since
-    eBay doesn't need it to accept the listing and blocking publish over an optional
-    field like "Genre" would be wrong.
+    text, (3) one of eBay's own "unknown" catch-all values if it offers one. Only a
+    genuinely unresolvable aspect with `required=True` ends up in the returned
+    `unresolved` list — an unresolvable *recommended* aspect (see get_category_aspects())
+    is simply left out of the returned dict instead, since eBay doesn't need it to
+    accept the listing and blocking publish over an optional field like "Genre" would
+    be wrong.
+
+    Deliberately does NOT fall back to a generic "Not Specified" placeholder for
+    unresolved `FREE_TEXT`-mode aspects, despite `aspectMode: FREE_TEXT` sounding like
+    "any string is accepted" — confirmed from a real production rejection (errorId
+    17460, "Structure Data Error") that some FREE_TEXT aspects still enforce a strict
+    server-side data format (e.g. "Device Charging Range" requires a 'min-max' numeric
+    pattern), so a fabricated placeholder can violate that format and get the whole
+    listing rejected. Treating every unresolved aspect the same way regardless of mode
+    — block if required, omit if not — is the only choice that's safe for *all*
+    aspects, not just the enum-constrained ones.
     """
     corpus = " ".join(
         [
@@ -319,10 +328,6 @@ def resolve_aspects(
         fallback = _find_fallback_aspect_value(values)
         if fallback:
             aspects[name] = [fallback]
-            continue
-
-        if aspect["mode"] == "FREE_TEXT":
-            aspects[name] = ["Not Specified"]
             continue
 
         if aspect.get("required"):

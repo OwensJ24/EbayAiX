@@ -472,16 +472,22 @@ already available, in order: (1) direct field match for Brand/Model, (2) a **wor
 substring — a naive check for shoe size `"9"` false-positived inside `"Air Max 90"` during testing, since
 fixed with a regex `\b` boundary) of one of eBay's suggested values against the identification's own text,
 (3) one of eBay's own "unknown" catch-all values when the aspect offers one (e.g. `"Unbranded"`, `"Not
-Applicable"` — these appear in eBay's own suggested-values lists, so using them is never a fabrication), (4)
-for `FREE_TEXT`-mode aspects only (eBay's suggested values are autocomplete, not a strict enum, so any string
-is accepted) an honest `"Not Specified"` placeholder, surfaced in the frontend preview as a flagged auto-fill.
+Applicable"` — these appear in eBay's own suggested-values lists, so using them is never a fabrication).
 **Only a genuinely unresolvable aspect with `required=True` raises a `RuntimeError`** (no data match, no
 catch-all value — e.g. "Department" for a shoe category, since guessing a gender department would be a real
 fabrication) from `_resolve_listing_data()` — surfaced to the user via the read-only draft-resolution routes
 well before any eBay write is attempted, rather than failing at `AddFixedPriceItem` time with the same
 cryptic error this exists to avoid. A genuinely unresolvable *recommended* aspect is simply left out of the
 listing instead — eBay doesn't need it, so blocking publish over an optional field like "Genre" would be
-wrong.
+wrong. **There used to be a step (4) here: an honest `"Not Specified"` placeholder for unresolved
+`FREE_TEXT`-mode aspects, on the reasoning that "eBay's suggested values are autocomplete, not a strict enum,
+so any string is accepted."** That reasoning was wrong, confirmed by a real production rejection (errorId
+17460, "Structure Data Error") — some `FREE_TEXT` aspects still enforce a strict server-side data format (e.g.
+"Device Charging Range" requires a `'min-max'` numeric pattern), and `"Not Specified"` doesn't satisfy that,
+so it got the whole listing rejected rather than safely accepted the way a true free-text field would. Fix:
+removed the FREE_TEXT special case entirely — an unresolved aspect is now handled identically regardless of
+mode (block if required, omit if not), since that's the only policy that's safe for every aspect, not just
+the enum-constrained ones.
 
 **Every listing this app creates has eBay's "Best Offer" feature enabled** —
 `_build_add_fixed_price_item_request()` unconditionally sets `Item.BestOfferDetails.BestOfferEnabled = true`,

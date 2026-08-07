@@ -1067,9 +1067,6 @@
         let html = '<p><strong>Item specifics eBay requires:</strong></p><ul>';
         html += aspectEntries.map(([name, values]) => `<li>${escapeHtml(name)}: ${escapeHtml(values.join(', '))}</li>`).join('');
         html += '</ul>';
-        if (aspectEntries.some(([, values]) => values.includes('Not Specified'))) {
-          html += '<p style="font-size:0.85rem; color:#8a6d00;">Some of these were auto-filled with a generic placeholder since they couldn\'t be determined — worth correcting via eBay after publishing if inaccurate.</p>';
-        }
         aspectsDisplayEl.innerHTML = html;
       } else {
         aspectsDisplayEl.innerHTML = '';
