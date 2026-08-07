@@ -217,20 +217,39 @@ matching Render log output (the request died mid-flight, before this app's own l
 ran), a much less diagnosable failure mode than this app's normal 4xx/502/503 JSON responses. *Every* file is
 validated/normalized before *any* of them are uploaded, so one bad photo aborts the whole request cleanly
 rather than leaving a partial set in Supabase. Each normalized image is then uploaded to **Supabase Storage**
-(`src/storage/supabase_storage.py`, see below) at `{upload_id}/{index}.jpg`.
+(`src/storage/supabase_storage.py`, see below) at `{upload_id}/{index}.jpg` — **concurrently**, via a
+`ThreadPoolExecutor` (`_UPLOAD_CONCURRENCY` = 8 workers), not one upload at a time. This is the first
+concurrency used anywhere in this codebase (every other network loop, including `create_listing()`'s per-photo
+EPS loop in `listing.py`, is still sequential); it exists because N sequential Supabase round trips were a
+real, measured chunk of this route's latency on batches with many photos, and each upload is fully
+independent (its own `{upload_id}/{index}.jpg` path, no shared state, no ordering requirement) — safe to
+parallelize with no correctness cost. httpx's sync `Client` (used throughout `supabase_storage.py`) is
+documented thread-safe; `HTTPException`s raised inside a worker (via `_call_storage`) propagate correctly
+through `future.result()` in the main thread, confirmed live, so error handling is unchanged in behavior.
 
 **Grouping is the user's own input, not something this route figures out.** Since splits only ever divide the
 sequential upload order (the user can't reorder photos, only mark boundaries between them), each item's
 `photo_indices` is always a contiguous range — `group_sizes` is walked to build them
 (`[3, 2]` -> item 0 gets `[0,1,2]`, item 1 gets `[3,4]`). For each item, one `VisionSubagent.preview()` call
-(see `vision_subagent.py` above) runs over that item's first `MAX_ANALYSIS_IMAGES` photos to seed its menu
-card with a real name/category guess — one cheap call per item, not one large call over the whole batch,
-which is both simpler and, in aggregate, usually cheaper than the AI-clustering approach this replaced (that
-one call had to examine the entire batch at once; N small calls each only look at one item's own handful of
-photos). Returns `{status: "batch_preview", upload_id, image_count, items: [{item_index, photo_indices,
-item_name, category}, ...]}` — `item_index` is just each item's 0-based position in this list, but it matters
-later: since several items now share one `upload_id`, it's what keeps their eBay SKUs from colliding at
-publish time (see `listing.py`'s `generate_sku()` below). No Taxonomy call happens here — category
+(see `vision_subagent.py` above) runs over that item's photos to seed its menu card with a real
+name/category guess — one cheap call per item, not one large call over the whole batch, which is both simpler
+and, in aggregate, usually cheaper than the AI-clustering approach this replaced (that one call had to examine
+the entire batch at once; N small calls each only look at one item's own handful of photos). **These calls
+also run concurrently** (same `ThreadPoolExecutor` pattern and worker cap as the upload loop above) — this was
+the *larger* of the two latency sources, since it previously meant one real Claude vision round trip per item,
+stacked one after another, even though each individual call is meant to be a "quick" guess; wall-clock time
+scaled directly with item count before this change. Each call is also now deliberately lighter than before:
+only `PREVIEW_ANALYSIS_IMAGES` (2, not `MAX_ANALYSIS_IMAGES`'s 5) photos, downscaled to
+`PREVIEW_THUMBNAIL_SIZE` (512px) by `_thumbnail_for_preview()` rather than sent at full eBay-quality
+resolution — a name+category guess doesn't need either the extra images or the extra resolution the way the
+later, per-item `identify()` phase does (that one still uses `MAX_ANALYSIS_IMAGES` full-quality photos
+unchanged, since it needs to actually read tags/labels closely). Results are collected keyed by each item's
+position (not just appended as futures complete) specifically so concurrent completion order can never scramble
+which `ItemPreview` result lands on which item — confirmed live that items come back in the same order as the
+submitted `group_sizes`. Returns `{status: "batch_preview", upload_id, image_count, items: [{item_index,
+photo_indices, item_name, category}, ...]}` — `item_index` is just each item's 0-based position in this list,
+but it matters later: since several items now share one `upload_id`, it's what keeps their eBay SKUs from
+colliding at publish time (see `listing.py`'s `generate_sku()` below). No Taxonomy call happens here — category
 suggestions are fetched lazily, only once the user actually opens a given item (see
 `POST /api/categories/search` below), since not every item in a batch necessarily gets worked on in the same
 sitting.

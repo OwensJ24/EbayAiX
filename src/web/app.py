@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -48,10 +49,26 @@ MAX_BATCH_IMAGES = 60
 # principle put more than 24 photos in one split group.
 MAX_ITEM_IMAGES = 24
 # Only the first MAX_ANALYSIS_IMAGES of *one item's* photos are sent to Claude's
-# preview()/identify() calls, independent of how many photos that item ends up with —
-# a handful of angles is enough to identify an item, and analyzing all of them would
-# multiply vision-call cost for little added benefit.
+# identify() call (the deep, per-item analysis — see /api/identify/confirm below),
+# independent of how many photos that item ends up with — a handful of angles is
+# enough to identify an item, and analyzing all of them would multiply vision-call
+# cost for little added benefit.
 MAX_ANALYSIS_IMAGES = 5
+# preview() (the quick name+category guess run for every item right after upload —
+# see /api/identify below) needs far less than identify() does; fewer, smaller images
+# keeps that pass fast, which matters a lot more here since it runs once per item,
+# blocking the menu screen from appearing at all until every item's guess is back.
+PREVIEW_ANALYSIS_IMAGES = 2
+# Longest side, in pixels, for the extra-small thumbnails built just for preview()
+# calls (see _thumbnail_for_preview() below) — distinct from EBAY_MAX_IMAGE_DIMENSION,
+# since a quick name+category guess doesn't need eBay-listing quality.
+PREVIEW_THUMBNAIL_SIZE = 512
+# Caps how many Supabase uploads / Claude preview() calls run at once in
+# /api/identify's two loops (see below) — high enough to collapse "sum of N/M
+# latencies" down to roughly "max single latency" for realistic batch sizes, capped
+# so a very large batch doesn't fire an unbounded number of simultaneous requests at
+# either API.
+_UPLOAD_CONCURRENCY = 8
 # eBay's own image requirements: below 500px on either dimension, "the listing may be
 # blocked" — silently, not with a clean rejection at listing-creation time, which is
 # exactly the "image not showing up" failure mode this guards against.
@@ -183,6 +200,19 @@ def _read_and_normalize_upload(file: UploadFile) -> bytes:
     return _validate_and_normalize_image(contents)
 
 
+def _thumbnail_for_preview(image_bytes: bytes) -> bytes:
+    """Downscales an already-normalized (eBay-quality, up to 1600px) image to a small
+    thumbnail just for preview() calls — a quick name+category guess doesn't need
+    eBay-listing quality, and smaller images mean faster per-call vision processing.
+    The original normalized bytes (not this thumbnail) are what's uploaded to Supabase
+    and later sent to identify() for the real per-item analysis."""
+    image = Image.open(io.BytesIO(image_bytes))
+    image.thumbnail((PREVIEW_THUMBNAIL_SIZE, PREVIEW_THUMBNAIL_SIZE), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
+
+
 def _call_claude(fn: Callable[..., T], *args, **kwargs) -> T:
     """Run a Claude-backed subagent call, translating transient API failures into clean HTTP errors."""
     try:
@@ -283,22 +313,58 @@ def identify(files: list[UploadFile] = File(...), group_sizes: str = Form(...)) 
     # Uploaded to Supabase Storage immediately — this, not this app's own server, is
     # what eBay will fetch imageUrls from later (see src/storage/supabase_storage.py
     # for why: Render's free tier sleeps, but Supabase doesn't, and eBay fetches images
-    # lazily rather than synchronously).
-    for i, image_bytes in enumerate(normalized_images):
-        _call_storage(upload_image, storage_config, upload_id, i, image_bytes)
+    # lazily rather than synchronously). Run concurrently, not one at a time — each
+    # upload is an independent network round trip to its own {upload_id}/{index}.jpg
+    # path, so there's no ordering or shared-state reason to serialize them, and doing
+    # so was directly responsible for a large chunk of this route's latency on batches
+    # with many photos.
+    with ThreadPoolExecutor(max_workers=_UPLOAD_CONCURRENCY) as executor:
+        futures = [
+            executor.submit(_call_storage, upload_image, storage_config, upload_id, i, image_bytes)
+            for i, image_bytes in enumerate(normalized_images)
+        ]
+        for future in as_completed(futures):
+            future.result()  # re-raises any HTTPException _call_storage produced
 
     # One cheap preview() call per item (not one big call over the whole batch, now
     # that grouping is the user's own manual input rather than something Claude has to
     # figure out) — gives each menu card a real name/category guess instead of a
-    # placeholder. Sequential, matching this codebase's style elsewhere.
-    items = []
+    # placeholder. Also run concurrently: this loop previously ran every item's
+    # preview() call one after another, so wall-clock time scaled directly with item
+    # count even though each individual call is meant to be a "quick" guess — the
+    # biggest single contributor to this route's overall latency. Each call also now
+    # gets only PREVIEW_ANALYSIS_IMAGES small thumbnails (see _thumbnail_for_preview())
+    # instead of MAX_ANALYSIS_IMAGES full eBay-quality photos, since a name+category
+    # guess doesn't need either the extra images or the extra resolution — that's
+    # what identify() (the real per-item analysis, run later, only for items the user
+    # actually opens) is for.
+    def _preview_item(photo_indices: list[int]) -> dict:
+        analysis_images = [
+            (_thumbnail_for_preview(normalized_images[i]), "image/jpeg")
+            for i in photo_indices[:PREVIEW_ANALYSIS_IMAGES]
+        ]
+        preview = _call_claude(_vision_subagent.preview, analysis_images)
+        return {"photo_indices": photo_indices, "item_name": preview.item_name, "category": preview.category}
+
+    item_photo_indices = []
     offset = 0
     for size in sizes:
-        photo_indices = list(range(offset, offset + size))
+        item_photo_indices.append(list(range(offset, offset + size)))
         offset += size
-        analysis_images = [(normalized_images[i], "image/jpeg") for i in photo_indices[:MAX_ANALYSIS_IMAGES]]
-        preview = _call_claude(_vision_subagent.preview, analysis_images)
-        items.append({"photo_indices": photo_indices, "item_name": preview.item_name, "category": preview.category})
+
+    with ThreadPoolExecutor(max_workers=_UPLOAD_CONCURRENCY) as executor:
+        # dict, not list(executor.map(...)), so results land back in split order even
+        # though they may finish out of order — executor.map would preserve order too,
+        # but future-per-item keeps this loop's error handling identical in shape to
+        # the upload loop above rather than mixing two different concurrency idioms.
+        future_to_position = {
+            executor.submit(_preview_item, photo_indices): position
+            for position, photo_indices in enumerate(item_photo_indices)
+        }
+        items_by_position: dict[int, dict] = {}
+        for future in as_completed(future_to_position):
+            items_by_position[future_to_position[future]] = future.result()
+        items = [items_by_position[i] for i in range(len(item_photo_indices))]
 
     return {
         "status": "batch_preview",
