@@ -42,12 +42,19 @@
       white-space: pre-wrap;
     }
 
+    /* Breaks out of body's centered max-width so the split grid can use the full
+       viewport width — everything else in the app stays in the narrower column. */
     .split-strip {
       display: flex;
+      flex-wrap: wrap;
       align-items: flex-end;
-      overflow-x: auto;
-      padding: 0.5rem 0 1rem;
-      margin-top: 1rem;
+      gap: 1rem 0.75rem;
+      width: 100vw;
+      position: relative;
+      left: 50%;
+      margin-left: -50vw;
+      padding: 0.5rem 1rem 1.5rem;
+      box-sizing: border-box;
     }
 
     .split-item {
@@ -55,37 +62,47 @@
       display: flex;
       flex-direction: column;
       align-items: center;
+      cursor: grab;
+    }
+
+    .split-item.dragging {
+      opacity: 0.4;
+    }
+
+    .split-item.drag-over .split-thumb {
+      outline: 3px dashed #d9534f;
+      outline-offset: 2px;
     }
 
     .split-label {
-      font-size: 0.7rem;
+      font-size: 0.85rem;
       font-weight: 700;
       color: #333;
       white-space: nowrap;
-      margin-bottom: 0.25rem;
-      min-height: 1em;
+      margin-bottom: 0.4rem;
+      min-height: 1.2em;
     }
 
     .split-thumb {
-      width: 90px;
-      height: 90px;
+      width: 180px;
+      height: 180px;
       object-fit: cover;
-      border-radius: 6px;
+      border-radius: 8px;
       border: 1px solid #ccc;
+      pointer-events: none;
     }
 
     .split-divider {
       flex: 0 0 auto;
       align-self: flex-end;
-      width: 28px;
-      height: 90px;
-      margin: 0 3px;
+      width: 40px;
+      height: 180px;
       border: none;
-      border-radius: 4px;
+      border-radius: 6px;
       background: #f0f0f0;
       color: #888;
       cursor: pointer;
-      font-size: 1rem;
+      font-size: 1.4rem;
       line-height: 1;
     }
 
@@ -646,7 +663,7 @@
       let html = '';
       for (let i = 0; i < n; i++) {
         const label = groupStartLabel.get(i) || '';
-        html += `<div class="split-item"><div class="split-label">${escapeHtml(label)}</div><img class="split-thumb" src="${currentPreviewThumbUrls[i]}" alt="photo ${i + 1}"></div>`;
+        html += `<div class="split-item" draggable="true" data-pos="${i}"><div class="split-label">${escapeHtml(label)}</div><img class="split-thumb" src="${currentPreviewThumbUrls[i]}" alt="photo ${i + 1}"></div>`;
         if (i < n - 1) {
           const active = splitAfter.has(i);
           html += `<button type="button" class="split-divider${active ? ' active' : ''}" data-index="${i}" title="${active ? 'Merge these back together' : 'Split into a new listing here'}">${active ? '✕' : '+'}</button>`;
@@ -661,6 +678,64 @@
       if (!btn) return;
       const i = parseInt(btn.dataset.index, 10);
       if (splitAfter.has(i)) splitAfter.delete(i); else splitAfter.add(i);
+      renderSplitStrip();
+    });
+
+    // Drag-to-reorder — native HTML5 drag-and-drop (desktop only; most mobile browsers
+    // don't fire these events for touch, a known limitation, not something worth a
+    // custom touch-drag implementation for this project's scale). Reordering changes
+    // which photos are adjacent, so any existing splits (tied to specific positions)
+    // no longer reliably mean what they did — reset them rather than risk silently
+    // misapplying a stale split after a reorder.
+    let dragSourcePos = null;
+
+    splitStripEl.addEventListener('dragstart', (e) => {
+      const item = e.target.closest('.split-item');
+      if (!item) return;
+      dragSourcePos = parseInt(item.dataset.pos, 10);
+      item.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(dragSourcePos));
+    });
+
+    splitStripEl.addEventListener('dragend', (e) => {
+      const item = e.target.closest('.split-item');
+      if (item) item.classList.remove('dragging');
+      splitStripEl.querySelectorAll('.split-item.drag-over').forEach((el) => el.classList.remove('drag-over'));
+      dragSourcePos = null;
+    });
+
+    splitStripEl.addEventListener('dragover', (e) => {
+      if (dragSourcePos === null || !e.target.closest('.split-item')) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+    });
+
+    splitStripEl.addEventListener('dragenter', (e) => {
+      const item = e.target.closest('.split-item');
+      if (item && dragSourcePos !== null) item.classList.add('drag-over');
+    });
+
+    splitStripEl.addEventListener('dragleave', (e) => {
+      const item = e.target.closest('.split-item');
+      if (item) item.classList.remove('drag-over');
+    });
+
+    splitStripEl.addEventListener('drop', (e) => {
+      const item = e.target.closest('.split-item');
+      if (!item || dragSourcePos === null) return;
+      e.preventDefault();
+      const targetPos = parseInt(item.dataset.pos, 10);
+      item.classList.remove('drag-over');
+      if (targetPos === dragSourcePos) return;
+
+      const [movedFile] = pendingFiles.splice(dragSourcePos, 1);
+      pendingFiles.splice(targetPos, 0, movedFile);
+      const [movedUrl] = currentPreviewThumbUrls.splice(dragSourcePos, 1);
+      currentPreviewThumbUrls.splice(targetPos, 0, movedUrl);
+      splitAfter = new Set();
+      splitStatusEl.innerHTML = '<p>Photo order changed — splits were reset, set them again below.</p>';
+
       renderSplitStrip();
     });
 

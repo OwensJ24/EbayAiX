@@ -145,19 +145,20 @@ once per item group the user defines via the split-divider UI — one call per g
 whole batch — using the first `MAX_ANALYSIS_IMAGES` of that group's photos; the result seeds that item's menu
 card (name + category) and is never used directly for listing creation.
 
-`VisionSubagent.identify(images, confirmed_item_name, confirmed_category, required_aspects=None) ->
+`VisionSubagent.identify(images, confirmed_item_name, confirmed_category, category_aspects=None) ->
 ProductIdentification` — the fuller analysis, only ever run *after* a human has confirmed/edited the name and
 picked a real eBay category (see `app.py`'s `/api/identify/confirm`). `confirmed_item_name`/`confirmed_category`
 are required params, not an optional override — the system prompt tells Claude to treat them as ground truth
 and analyze everything else (brand, model number, condition, description); after parsing, `identify()`
 defensively overwrites `item_name`/`category` on the result with the confirmed strings rather than trusting
-the model to echo them back exactly. `required_aspects` (eBay's required item specifics for the confirmed
-category, from `listing.py`'s `get_required_aspects()` — see `app.py`'s `/api/identify/confirm` below) is
-optional but always passed in practice; when given, the prompt explicitly lists what eBay requires (e.g.
-"Brand, Model, Type, Connectivity, Color") and asks Claude to look across all provided photos — including
-tags/labels/packaging — for each one, using eBay's own suggested vocabulary where it matches. This directly
-improves `resolve_aspects()`'s word-boundary text-matching in `listing.py` (unchanged code, richer input)
-rather than requiring any change to that matching logic itself. Uses structured outputs
+the model to echo them back exactly. `category_aspects` (both required *and* recommended item specifics for
+the confirmed category, from `listing.py`'s `get_category_aspects()` — see `app.py`'s `/api/identify/confirm`
+below) is optional but always passed in practice; when given, the prompt lists each one tagged `[required]` or
+`[recommended]` (e.g. "Brand [required]", "Genre [recommended]") and asks Claude to look across all provided
+photos — including tags/labels/packaging — for each one, using eBay's own suggested vocabulary where it
+matches, explicitly noting that recommended fields are fine to leave out if genuinely not visible. This
+directly improves `resolve_aspects()`'s word-boundary text-matching in `listing.py` (unchanged matching logic,
+richer input — see below for why required vs. recommended matters there too). Uses structured outputs
 (`client.messages.parse(..., output_format=ProductIdentification)`) to force a strict schema: item name,
 brand, model number, category, `category_id` (the confirmed real eBay categoryId, set by the caller —
 Claude never produces this), a constrained condition enum, condition notes, a buyer-facing
@@ -250,10 +251,10 @@ request from `/api/identify` with
 no server-side session state, it re-fetches the first `photo_indices[:MAX_ANALYSIS_IMAGES]` via `httpx.get()`
 on their already-uploaded Supabase public URLs (same pattern `create_listing()` in `listing.py` uses to
 re-fetch an image before EPS upload) rather than keeping anything in memory across requests. It also fetches
-this category's required item specifics via `get_required_aspects()` (`listing.py`, reused as-is, using the
+this category's item specifics via `get_category_aspects()` (`listing.py`, reused as-is, using the
 same application-level Taxonomy token) *before* calling `VisionSubagent.identify()` (Phase 2 — the full
-analysis, informed by the *confirmed* name/category and by what eBay actually requires for this category,
-rather than re-guessing either), sets `identification.category_id = category_id` on the result (Claude never
+analysis, informed by the *confirmed* name/category and by what eBay actually requires/recommends for this
+category, rather than re-guessing either), sets `identification.category_id = category_id` on the result (Claude never
 produces this — it's the real eBay Taxonomy ID the user picked), and returns the final `ProductIdentification`.
 Every downstream step (`/api/price`, `/api/listing/draft`, the edit-before-publish screen,
 `/api/listing/publish/{upload_id}`) is unchanged — they already just consume whatever `ProductIdentification`
@@ -428,30 +429,40 @@ not the ~12-per-*variation* figure an earlier version of this doc incorrectly ge
 `_call_trading_api(..., "AddFixedPriceItem", ...)` -> extracts `ItemID` from the response and returns a
 `CreateListingResult` (`item_id`, `listing_url`, `missing`, `notes`).
 
-**Required item specifics ("aspects") are resolved per category, not just Brand — and now actively targeted
-during identification, not just matched after the fact.** Many eBay categories reject listing creation
-outright if required aspects are missing — e.g. Headphones requires
-Brand/Model/Type/Connectivity/Color, not just Brand — surfacing as `errorId 25002` ("item specific X is
-missing"), discovered from a real production error under the prior Inventory API design (the same error
-family as the old merchant-location "Item.Country" case). `get_required_aspects()` fetches these via the
-Taxonomy API's `get_item_aspects_for_category`; besides its use here, `app.py`'s `/api/identify/confirm` now
+**Item specifics ("aspects") cover both required and recommended fields per category, not just the hard
+requirements — a real, reported gap, not a hypothetical.** Many eBay categories reject listing creation
+outright if *required* aspects are missing — e.g. Headphones requires Brand/Model/Type/Connectivity/Color, not
+just Brand — surfacing as `errorId 25002` ("item specific X is missing"), discovered from a real production
+error under the prior Inventory API design (the same error family as the old merchant-location "Item.Country"
+case). But eBay's Taxonomy API also returns *recommended* (not required) aspects per category — e.g. for
+Video Games & Consoles: Publisher, Genre, Rating, Region Code, Release Year — that earlier versions of this
+function filtered out entirely by only keeping `aspectConstraint.aspectRequired == true`, silently dropping
+fields a real seller would want filled in even though eBay doesn't hard-block their absence.
+`get_category_aspects()` fixes this: fetches both required aspects and ones eBay marks `aspectUsage:
+"RECOMMENDED"` (skipping true `"OPTIONAL"`-usage ones, low-value enough to not be worth the fabrication risk),
+tagging each with a `required: bool`. **That flag must come from `aspectConstraint.aspectRequired`, not
+`aspectUsage`** — confirmed against eBay's own docs and live against a real category's response that a
+genuinely required aspect is *also* reported as `aspectUsage: "RECOMMENDED"`, making `aspectUsage` alone
+useless for telling required and recommended apart. Besides its use here, `app.py`'s `/api/identify/confirm`
 also calls it *before* `VisionSubagent.identify()` and passes the result in as `identify()`'s
-`required_aspects` param (see `vision_subagent.py` above), so Claude actively looks for each required aspect
-across all provided photos during analysis — rather than this function's `resolve_aspects()` being the only
-place trying to recover them, after the fact, from whatever free-text Claude happened to write.
-`resolve_aspects()` fills them from `identification` data
+`category_aspects` param (see `vision_subagent.py` above, which tags each line `[required]`/`[recommended]` in
+the prompt), so Claude actively looks for each one across all provided photos during analysis — rather than
+this function's `resolve_aspects()` being the only place trying to recover them, after the fact, from
+whatever free-text Claude happened to write. `resolve_aspects()` fills them from `identification` data
 already available, in order: (1) direct field match for Brand/Model, (2) a **word-boundary** match (not naive
 substring — a naive check for shoe size `"9"` false-positived inside `"Air Max 90"` during testing, since
 fixed with a regex `\b` boundary) of one of eBay's suggested values against the identification's own text,
 (3) one of eBay's own "unknown" catch-all values when the aspect offers one (e.g. `"Unbranded"`, `"Not
 Applicable"` — these appear in eBay's own suggested-values lists, so using them is never a fabrication), (4)
 for `FREE_TEXT`-mode aspects only (eBay's suggested values are autocomplete, not a strict enum, so any string
-is accepted) an honest `"Not Specified"` placeholder, surfaced in the frontend preview as a flagged
-auto-fill. Only a genuinely unresolvable non-free-text aspect (no data match, no catch-all value — e.g.
-"Department" for a shoe category, since guessing a gender department would be a real fabrication) raises a
-`RuntimeError` from `_resolve_listing_data()` — surfaced to the user via the read-only draft-resolution
-routes well before any eBay write is attempted, rather than failing at `AddFixedPriceItem` time with the same
-cryptic error this exists to avoid.
+is accepted) an honest `"Not Specified"` placeholder, surfaced in the frontend preview as a flagged auto-fill.
+**Only a genuinely unresolvable aspect with `required=True` raises a `RuntimeError`** (no data match, no
+catch-all value — e.g. "Department" for a shoe category, since guessing a gender department would be a real
+fabrication) from `_resolve_listing_data()` — surfaced to the user via the read-only draft-resolution routes
+well before any eBay write is attempted, rather than failing at `AddFixedPriceItem` time with the same
+cryptic error this exists to avoid. A genuinely unresolvable *recommended* aspect is simply left out of the
+listing instead — eBay doesn't need it, so blocking publish over an optional field like "Genre" would be
+wrong.
 
 **Condition resolution is category-aware, not a flat static mapping — this was a real bug, not a
 hypothetical.** `_CONDITION_MAP` (our 6-tier `ProductIdentification.condition` -> a default numeric

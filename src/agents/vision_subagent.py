@@ -45,14 +45,21 @@ _SYSTEM_PROMPT = (
     "For content_description, write it like a real, simple eBay listing description — "
     "not a narrative about what the item is. The title is added separately and already "
     "covers that; do not repeat it. Structure: (1) If this is a functional/electronic "
-    "item, confirm its functionality in one short line, e.g. 'Tested and working' — "
-    "unless the condition is 'For Parts' or otherwise non-functional, in which case say "
-    "so honestly instead (e.g. 'Sold for parts, not tested' or 'Not functional'). Omit "
-    "this line entirely for items where a working/non-working claim doesn't apply (e.g. "
-    "clothing, books, purely decorative items). (2) List relevant specifics as short, "
-    "plain facts — model number, style, size, material, color, included accessories — "
-    "whatever applies. Keep it brief and factual, not descriptive prose. Do NOT mention "
-    "wear, damage, defects, or condition here; that belongs only in condition_notes.\n\n"
+    "item, assume and state that it is tested and working — 'Tested and working', "
+    "stated plainly and confidently, not hedged (avoid phrases like 'appears to work' "
+    "or 'untested') — unless the condition is 'For Parts' or there is clear visible "
+    "evidence of non-function, in which case say so honestly instead (e.g. 'Sold for "
+    "parts, not tested' or 'Not functional'). Omit this line entirely for items where "
+    "a working/non-working claim doesn't apply (e.g. clothing, books, purely "
+    "decorative items). (2) List relevant specifics as short, plain facts — model "
+    "number, style, size, material, color, and what's included — whatever applies. "
+    "Only state what IS present; never describe what's missing or absent (e.g. never "
+    "write 'no controller included', 'cables not included', or similar). If the item "
+    "is just the bare unit with no accessories, packaging, or extras visible, say so "
+    "with a short, standard phrase like 'Console only' or 'Unit only' (whatever fits "
+    "the item type) rather than listing what it doesn't come with. Keep it brief and "
+    "factual, not descriptive prose. Do NOT mention wear, damage, defects, or "
+    "condition here; that belongs only in condition_notes.\n\n"
     "For distinguishing_features, be thorough: this is what downstream eBay category "
     "item-specifics resolution draws from, so note every visible detail that could match "
     "one of eBay's required specifics for this category (size, color, material, style, "
@@ -129,24 +136,27 @@ class VisionSubagent:
         images: list[tuple[bytes, str]],
         confirmed_item_name: str,
         confirmed_category: str,
-        required_aspects: list[dict] | None = None,
+        category_aspects: list[dict] | None = None,
     ) -> ProductIdentification:
         prompt_text = (
             f'The user has confirmed this item is: "{confirmed_item_name}", '
             f'in eBay category: "{confirmed_category}". '
             "Analyze the photo(s) for everything else: brand, model number, condition, and description."
         )
-        if required_aspects:
+        if category_aspects:
             aspect_lines = []
-            for aspect in required_aspects:
+            for aspect in category_aspects:
                 values = aspect.get("values") or []
                 values_note = f" (eBay's suggested values include: {', '.join(values[:15])})" if values else ""
-                aspect_lines.append(f"- {aspect['name']}{values_note}")
+                tag = "required" if aspect.get("required") else "recommended"
+                aspect_lines.append(f"- {aspect['name']} [{tag}]{values_note}")
             prompt_text += (
-                "\n\neBay requires the following item specifics for this category — look across all "
-                "provided photos (including any tags, labels, or packaging) for each one, and note it "
-                "explicitly in distinguishing_features, using eBay's own suggested wording above when it "
-                "matches what you see (do not fabricate a value you can't actually determine):\n"
+                "\n\neBay uses the following item specifics for this category, marked required or "
+                "recommended — look across all provided photos (including any tags, labels, or "
+                "packaging) for each one, and note it explicitly in distinguishing_features, using "
+                "eBay's own suggested wording above when it matches what you see. Do not fabricate a "
+                "value you can't actually determine — this matters even more for 'recommended' fields, "
+                "since it's fine to simply leave those out if genuinely not visible:\n"
                 + "\n".join(aspect_lines)
             )
 

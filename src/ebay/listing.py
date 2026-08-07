@@ -209,13 +209,25 @@ def resolve_condition(config: EbayConfig, token: str, category_id: str | None, c
         return default, False
 
 
-def get_required_aspects(config: EbayConfig, token: str, category_id: str) -> list[dict]:
-    """Fetches eBay's required item specifics ('aspects') for a category via the
-    Taxonomy API. Many categories reject listing creation entirely if these aren't
-    present (e.g. Headphones requires Brand/Model/Type/Connectivity/Color) — this is
-    what errorId 25002 "item specific X is missing" means. Each returned dict has
-    `name`, `values` (eBay's suggested values — an autocomplete list, not a strict
-    enum, when `mode` is "FREE_TEXT") and `mode`.
+def get_category_aspects(config: EbayConfig, token: str, category_id: str) -> list[dict]:
+    """Fetches eBay's item specifics ('aspects') for a category via the Taxonomy API —
+    both hard-required aspects and ones eBay marks RECOMMENDED (e.g. for Video Games &
+    Consoles: Publisher, Genre, Rating, Region Code, Release Year are all RECOMMENDED,
+    not required, and were previously filtered out entirely — a real, reported gap, not
+    a hypothetical). Skips OPTIONAL-usage aspects (e.g. "California Prop 65 Warning"):
+    low-value enough that attempting to fill them mostly adds noise or fabrication risk
+    for little buyer-facing benefit.
+
+    Each returned dict has `name`, `values` (eBay's suggested values — an autocomplete
+    list, not a strict enum, when `mode` is "FREE_TEXT"), `mode`, and `required` (bool).
+    `required` comes from `aspectConstraint.aspectRequired`, NOT `aspectUsage` — eBay's
+    own docs confirm `aspectUsage` is unreliable for this specifically, since a truly
+    required aspect is *also* reported as `aspectUsage: "RECOMMENDED"` (confirmed live
+    against a real category's response); `aspectRequired` is the only trustworthy
+    signal for whether an unresolved aspect should actually block listing creation (see
+    resolve_aspects() below) — required aspects still do; recommended ones don't, they
+    just get left out of the listing if genuinely undeterminable, e.g. errorId 25002
+    "item specific X is missing" only applies to the former.
     """
     try:
         response = httpx.get(
@@ -225,23 +237,25 @@ def get_required_aspects(config: EbayConfig, token: str, category_id: str) -> li
             timeout=15.0,
         )
         response.raise_for_status()
-        required = []
+        aspects = []
         for aspect in response.json().get("aspects", []):
             constraint = aspect.get("aspectConstraint", {})
-            if not constraint.get("aspectRequired"):
+            required = bool(constraint.get("aspectRequired"))
+            if not required and constraint.get("aspectUsage") != "RECOMMENDED":
                 continue
-            required.append(
+            aspects.append(
                 {
                     "name": aspect["localizedAspectName"],
                     "values": [
                         v["localizedValue"] for v in aspect.get("aspectValues", []) if v.get("localizedValue")
                     ],
                     "mode": constraint.get("aspectMode"),
+                    "required": required,
                 }
             )
-        return required
+        return aspects
     except (httpx.HTTPError, KeyError) as e:
-        logger.info("get_required_aspects degraded: %r", e)
+        logger.info("get_category_aspects degraded: %r", e)
         return []
 
 
@@ -256,16 +270,19 @@ def _find_fallback_aspect_value(values: list[str]) -> str | None:
 
 
 def resolve_aspects(
-    identification: ProductIdentification, required_aspects: list[dict]
+    identification: ProductIdentification, category_aspects: list[dict]
 ) -> tuple[dict[str, list[str]], list[str]]:
-    """Best-effort fills eBay's required aspects from data already in `identification`
-    — never fabricates a plausible-sounding but made-up value (e.g. never guesses a
+    """Best-effort fills eBay's item specifics from data already in `identification` —
+    never fabricates a plausible-sounding but made-up value (e.g. never guesses a
     color). Resolution order per aspect: (1) direct field match for Brand/Model, (2) a
     substring match of one of eBay's suggested values against the identification's own
     text, (3) one of eBay's own "unknown" catch-all values if it offers one, (4) for
     FREE_TEXT aspects only (no real enum to violate) an honest 'Not Specified'
-    placeholder. Only truly unresolvable non-free-text aspects end up in the returned
-    unresolved list.
+    placeholder. Only a genuinely unresolvable aspect with `required=True` ends up in
+    the returned `unresolved` list — an unresolvable *recommended* aspect (see
+    get_category_aspects()) is simply left out of the returned dict instead, since
+    eBay doesn't need it to accept the listing and blocking publish over an optional
+    field like "Genre" would be wrong.
     """
     corpus = " ".join(
         [
@@ -279,7 +296,7 @@ def resolve_aspects(
     aspects: dict[str, list[str]] = {}
     unresolved: list[str] = []
 
-    for aspect in required_aspects:
+    for aspect in category_aspects:
         name = aspect["name"]
         values = aspect["values"]
 
@@ -308,7 +325,10 @@ def resolve_aspects(
             aspects[name] = ["Not Specified"]
             continue
 
-        unresolved.append(name)
+        if aspect.get("required"):
+            unresolved.append(name)
+        # else: unresolvable but only recommended, not required — leave it out rather
+        # than block or fabricate.
 
     return aspects, unresolved
 
@@ -393,8 +413,8 @@ def _resolve_listing_data(
 
     aspects: dict[str, list[str]] = {}
     if category_id:
-        required_aspects = get_required_aspects(config, token, category_id)
-        aspects, unresolved_aspects = resolve_aspects(identification, required_aspects)
+        category_aspects = get_category_aspects(config, token, category_id)
+        aspects, unresolved_aspects = resolve_aspects(identification, category_aspects)
         if unresolved_aspects:
             # eBay validates item specifics when the listing is created — letting this
             # through would just fail moments later with the same cryptic errorId 25002
@@ -664,6 +684,16 @@ def _build_add_fixed_price_item_request(
     _sub(item, "PostalCode", location.postal_code)
     _sub(item, "ListingDuration", "GTC")
     _sub(item, "ListingType", "FixedPriceItem")
+
+    # Lets buyers submit a lower offer instead of paying the listed price outright, on
+    # every listing this app publishes. Not every eBay category supports Best Offer
+    # (confirmed against eBay's own docs) — rather than pre-checking via a separate
+    # GetCategoryFeatures call for a category that will almost always support it, this
+    # is sent unconditionally; the rare unsupported-category case surfaces as a normal
+    # eBay rejection through the existing EbayTradingApiError handling, the same way
+    # every other category-specific constraint in this file is discovered and handled.
+    best_offer_details = _sub(item, "BestOfferDetails")
+    _sub(best_offer_details, "BestOfferEnabled", "true")
 
     picture_details = _sub(item, "PictureDetails")
     for url in image_urls:

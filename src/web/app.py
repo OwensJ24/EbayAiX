@@ -14,13 +14,13 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageCms, UnidentifiedImageError
+from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
 from src.agents.vision_subagent import ProductIdentification, VisionSubagent
 from src.ebay.browse import build_query, get_application_access_token, load_ebay_browse_config, search_comparable_listings
 from src.ebay.config import load_ebay_config
-from src.ebay.listing import EbayTradingApiError, create_listing, get_required_aspects, resolve_draft_listing, suggest_categories
+from src.ebay.listing import EbayTradingApiError, create_listing, get_category_aspects, resolve_draft_listing, suggest_categories
 from src.ebay.seller_location import save_seller_location
 from src.ebay.token_store import get_valid_access_token
 from src.storage.supabase_storage import load_supabase_storage_config, public_url, upload_image
@@ -139,6 +139,17 @@ def _validate_and_normalize_image(contents: bytes) -> bytes:
         image.load()
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="File isn't a readable image.")
+
+    # Phone cameras store photos in raw sensor orientation plus an EXIF Orientation tag
+    # telling viewers how to rotate/flip it for display — Image.open() doesn't apply
+    # that automatically. Without this, a portrait phone photo gets its correct-looking
+    # preview in the browser (which does honor EXIF) but silently loses that rotation
+    # once re-encoded below (no EXIF carried forward), coming out sideways everywhere
+    # downstream, including on the published eBay listing. exif_transpose() bakes the
+    # rotation into the actual pixel data and strips the now-redundant tag, so this must
+    # run before width/height are read below — a portrait photo's sensor-native
+    # width/height are swapped relative to its correctly-oriented display size.
+    image = ImageOps.exif_transpose(image)
 
     width, height = image.size
     if width < EBAY_MIN_IMAGE_DIMENSION or height < EBAY_MIN_IMAGE_DIMENSION:
@@ -338,20 +349,21 @@ def confirm_item(payload: ConfirmItemRequest) -> dict:
         for i in payload.photo_indices[:MAX_ANALYSIS_IMAGES]
     ]
 
-    # Application-level eBay token — needed to fetch this category's required item
-    # specifics so identify() can actively look for each one across all photos (e.g. a
-    # size printed on a tag), rather than relying purely on post-hoc text matching in
-    # listing.py's resolve_aspects().
+    # Application-level eBay token — needed to fetch this category's item specifics
+    # (both required and recommended — see get_category_aspects()) so identify() can
+    # actively look for each one across all photos (e.g. a size printed on a tag),
+    # rather than relying purely on post-hoc text matching in listing.py's
+    # resolve_aspects().
     browse_config = _call_ebay(load_ebay_browse_config)
     app_token = _call_ebay(get_application_access_token, browse_config)
-    required_aspects = _call_ebay(get_required_aspects, browse_config, app_token, payload.category_id)
+    category_aspects = _call_ebay(get_category_aspects, browse_config, app_token, payload.category_id)
 
     identification = _call_claude(
         _vision_subagent.identify,
         analysis_images,
         payload.item_name,
         payload.category_name,
-        required_aspects,
+        category_aspects,
     )
 
     identification.category_id = payload.category_id
