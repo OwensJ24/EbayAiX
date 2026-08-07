@@ -352,7 +352,26 @@ def get_listing_policies(config: EbayConfig, token: str) -> dict[str, str]:
             )
             response.raise_for_status()
             items = response.json().get(list_key, [])
-            if items:
+            if not items:
+                continue
+            if offer_key == "paymentPolicyId":
+                # Every listing this app creates has Best Offer enabled (see
+                # _build_add_fixed_price_item_request()), and eBay's own platform
+                # rules make Best Offer and "require immediate payment" mutually
+                # exclusive on a single listing — confirmed from a real rejection
+                # (errorId 23015, "If this item sells by a Best Offer, you will not
+                # be able to require immediate payment"). Prefer a payment policy
+                # that doesn't require immediate payment over the account's
+                # first/default one, which may well be an immediate-pay policy set
+                # up before this app ever enabled Best Offer. Falls back to the
+                # first policy if every one of the account's payment policies
+                # requires immediate payment — this app has no way to change a
+                # payment policy's own settings remotely, so at that point eBay's
+                # own error (surfaced cleanly via EbayTradingApiError) is what tells
+                # the seller to fix it in Seller Hub.
+                chosen = next((p for p in items if not p.get("immediatePay")), items[0])
+                policies[offer_key] = chosen[id_key]
+            else:
                 policies[offer_key] = items[0][id_key]
         except httpx.HTTPStatusError as e:
             logger.info("get_listing_policies(%s) degraded: %d %s", endpoint, e.response.status_code, e.response.text[:300])

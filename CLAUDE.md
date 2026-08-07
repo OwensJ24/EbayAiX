@@ -464,6 +464,23 @@ cryptic error this exists to avoid. A genuinely unresolvable *recommended* aspec
 listing instead — eBay doesn't need it, so blocking publish over an optional field like "Genre" would be
 wrong.
 
+**Every listing this app creates has eBay's "Best Offer" feature enabled** —
+`_build_add_fixed_price_item_request()` unconditionally sets `Item.BestOfferDetails.BestOfferEnabled = true`,
+letting buyers submit a lower offer instead of paying the listed price. Not every eBay category supports Best
+Offer; rather than a separate `GetCategoryFeatures` pre-check for a category that will almost always support
+it, this is sent unconditionally and the rare unsupported-category case surfaces as a normal eBay rejection
+through the existing `EbayTradingApiError` handling.
+
+**Best Offer and "require immediate payment" are mutually exclusive on a single eBay listing — a real,
+observed rejection, not a hypothetical.** eBay's platform rule (confirmed from a real production error,
+`errorId 23015`: "If this item sells by a Best Offer, you will not be able to require immediate payment")
+blocks publishing outright if the referenced payment policy has immediate payment turned on. Since Best Offer
+is now always on, `get_listing_policies()` (below) no longer blindly takes the account's first payment
+policy — it prefers one where the Account API's `immediatePay` field is falsy, falling back to the first
+policy only if every one of the account's payment policies requires immediate payment (this app has no way to
+change a payment policy's own settings remotely, so at that point eBay's own error is what tells the seller
+to fix it in Seller Hub).
+
 **Condition resolution is category-aware, not a flat static mapping — this was a real bug, not a
 hypothetical.** `_CONDITION_MAP` (our 6-tier `ProductIdentification.condition` -> a default numeric
 `ConditionID` guess) is only a fallback now. eBay categories restrict which conditions are actually valid —
